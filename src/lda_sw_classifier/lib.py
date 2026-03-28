@@ -84,7 +84,8 @@ def prepare_parameters(config):
         "eps": config["parameters"]["eps"],
         "kappa1": config["parameters"]["kappa1"],
         "kappa2": config["parameters"]["kappa2"],
-        "note": config["parameters"]["note"]
+        "note": config["parameters"]["note"],
+        "nuclei": config["parameters"]["nuclei"]
     }
     return parameters
 
@@ -95,22 +96,47 @@ def read_bmrb_id(bmrbID_path):
         scanlist.pop(-1)
     return scanlist
 ############################## SW CLASSIFIER ###################################
-def normalize_matrix_col(matrix):
+# def normalize_matrix_col(matrix):
+#     """
+#     Function normalizing columns.
+#     """
+#     col_sums = np.sum(matrix, axis=0)
+#     col_sums[col_sums == 0] = 1
+#     matrix = matrix/col_sums
+#     return matrix
+
+# def normalize_matrix_rows(matrix):
+#     """
+#     Function normalising rows.
+#     """
+#     row_sums = np.sum(matrix, axis=1)
+#     row_sums[row_sums == 0] = 1
+#     matrix = matrix/row_sums[:, np.newaxis]
+#     return matrix
+
+def normalize_matrix_col(matrix, eps=1e-12):
     """
-    Function normalizing columns.
+    Normalize columns and clip values to (eps, 1 - eps).
     """
     col_sums = np.sum(matrix, axis=0)
     col_sums[col_sums == 0] = 1
-    matrix = matrix/col_sums
+    matrix = matrix / col_sums
+
+    # Clip to avoid exact 0 or 1
+    matrix = np.clip(matrix, eps, 1 - eps)
     return matrix
 
-def normalize_matrix_rows(matrix):
+
+def normalize_matrix_rows(matrix, eps=1e-12):
     """
-    Function normalising rows.
+    Normalize rows and clip values to (eps, 1 - eps).
     """
     row_sums = np.sum(matrix, axis=1)
     row_sums[row_sums == 0] = 1
-    matrix = matrix/row_sums[:, np.newaxis]
+    matrix = matrix / row_sums[:, np.newaxis]
+
+    # Clip to avoid exact 0 or 1
+    matrix = np.clip(matrix, eps, 1 - eps)
     return matrix
 
 def get_random_projections(
@@ -845,6 +871,7 @@ def classify_sw_spec(
         scale, kappa1=kappa1, kappa2=kappa2, k = k, with_bins = with_bins
     )
 
+
 def accuracy(check, labels):
     len_all = check.shape[0]
     li = 0
@@ -863,6 +890,16 @@ def accuracy(check, labels):
     return li / len_all, yes_no
 
 def count_neighbours(group, nuclei, eps):
+    # --- Single nucleus case ---
+    if len(nuclei) == 1:
+        col = nuclei[0]
+        group_subset = group[[col]]
+        distances = cdist(group_subset.values, group_subset.values, metric="euclidean")
+        neighbours = (distances <= eps).sum(axis=1)
+        group["neighbours"] = neighbours
+        return group
+
+    # return group
     all_comb = []
     for l in range(1, len(nuclei)):
         all_comb += combinations(nuclei, l)
@@ -891,6 +928,7 @@ def find_best_reference(AATs_count, train_t, nuclei, eps):
 def lda_classification_validate(parameters, protein, scanlist, output_dir) :
     content = {}
     algo = parameters["algo"]
+    note = parameters["note"]
     names = ["H", "HB", "HB1", "HB2", "HB3", "CA", "CB", "C", "CO", "N", "amino", "protein"]
     TableB = pd.DataFrame(columns=names)
 
@@ -959,7 +997,7 @@ def lda_classification_validate(parameters, protein, scanlist, output_dir) :
                 "M": "MET", "F": "PHE", "P": "PRO", "S": "SER", "T": "THR", "W": "TRP",
                 "Y": "TYR", "V": "VAL"}
 
-    nuclei = ["HN", "N", "CO", "CA", "CB", "HA", "HB"]
+    nuclei = parameters["nuclei"]
     train_data = pd.DataFrame(TableA, columns=nuclei+["amino", "protein"])
 
     protein_filter = {}
@@ -1173,8 +1211,8 @@ def lda_classification_validate(parameters, protein, scanlist, output_dir) :
     content["lda_accuracy"] = accuracy(check_labels, test_lab)
 
     if algo in ["lda", "lda_bootstrap"]:
-        df_protein.to_csv(Path(output_dir) / f"labels_{protein}_lda.csv")
-        df_probs.to_csv(Path(output_dir) / f"probabilities_{protein}_lda.csv")
+        df_protein.to_csv(Path(output_dir) / f"labels_{protein}_{algo}_{note}.csv")
+        df_probs.to_csv(Path(output_dir) / f"probabilities_{protein}_{algo}_{note}.csv")
 
     if algo in ["filtered", "filtered_bootstrap"]:
         fltr =  [i
@@ -1200,6 +1238,7 @@ def lda_classification_classify(
     fasta = "".join(fasta)
     content = {}
     algo = parameters["algo"]
+    note = parameters["note"]
     names = ["H", "HB", "HB1", "HB2", "HB3", "CA", "CB", "C", "CO", "N", "amino", "protein"]
 
     test_data = pd.read_excel(excel_protein, engine="openpyxl")
@@ -1484,12 +1523,12 @@ def lda_classification_classify(
     content["lda_probs"] = df_probs
 
     if algo == "lda":
-        df_protein.to_csv(Path(output_dir) / "labels_lda.csv")
-        df_probs.to_csv(Path(output_dir) / "probabilities_lda.csv")
+        df_protein.to_csv(Path(output_dir) / f"labels_lda_{note}.csv")
+        df_probs.to_csv(Path(output_dir) / f"probabilities_lda_{note}.csv")
 
     if algo == "lda_bootstrap":
-        df_protein.to_csv(Path(output_dir) / "labels_lda_bootstrap.csv")
-        df_probs.to_csv(Path(output_dir) / "probabilities_lda_bootstrap.csv")
+        df_protein.to_csv(Path(output_dir) / f"labels_lda_bootstrap_{note}.csv")
+        df_probs.to_csv(Path(output_dir) / f"probabilities_lda_bootstrap_{note}.csv")
 
     if algo in ["filtered", "filtered_bootstrap"]:
         fltr = [i
@@ -1639,7 +1678,7 @@ def classify_in_combination(
 
 def validate(i, train, test, parameters, parameters_amino, param_str, output_dir):
     train_labels, check_labels, test_drop, nuclei = prepare_labels(train, test)
-    nuclei = ["HN", "N", "CO", "CA", "CB", "HA", "HB"]
+    nuclei = parameters["nuclei"]
     useful_structs = useful_structures(test_drop)
     test_lab, test_nan, combs_nan, prob_matrix = useful_structs
 
@@ -1654,7 +1693,7 @@ def validate(i, train, test, parameters, parameters_amino, param_str, output_dir
 
 
     df_prob = pd.DataFrame(
-        normalize_matrix_col(prob_matrix), index = ALL_POSSIBLE, columns=check_labels
+        normalize_matrix_col(prob_matrix, 0), index = ALL_POSSIBLE, columns=check_labels
     )
     df_protein = pd.DataFrame({"real labels": check_labels, "classified as": test_lab, "score SW": df_prob.T.max(axis=1).values})
 

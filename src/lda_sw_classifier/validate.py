@@ -108,7 +108,7 @@ def main() -> None:
         for protein in bmrb_id:
             cv_accuracy[protein] = proteins[protein]["content_lda"]["lda_accuracy"]
         df_accuracy = pd.DataFrame(cv_accuracy)
-        df_accuracy.to_csv(output_dir / "accuracy_validation_lda.csv")
+        df_accuracy.to_csv(output_dir / f"accuracy_validation_{parameters["algo"]}_{parameters["note"]}.csv")
 
     elif parameters["algo"] == "sw":
         for protein in bmrb_id:

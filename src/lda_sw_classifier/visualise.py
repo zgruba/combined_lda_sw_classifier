@@ -46,7 +46,7 @@ def build_param_str(parameters: Dict[str, Any]) -> str:
     """
     keys = [
         "algo", "n_projections", "seed", "k", "device", "with_bins",
-        "sample_method", "vote_type", "scale", "eps", "kappa1", "kappa2", "note"
+        "sample_method", "vote_type", "scale", "eps", "kappa1", "kappa2", "note", "nuclei"
     ]
     return "_".join(str(parameters[k]) for k in keys).replace(".", "_")
 
@@ -82,7 +82,7 @@ def calculate_accuracy_stats(cv_accuracy: Dict[str, Tuple[float]]) -> Tuple[floa
     return np.mean(accuracies), np.std(accuracies)
 
 
-def get_label_file_path(lab_dir: Path, bmrb_id: str, algo: str, param_str: str) -> Path:
+def get_label_file_path(lab_dir: Path, bmrb_id: str, algo: str, param_str: str, note: str) -> Path:
     """
     Determine the filepath for label CSV based on algorithm and parameters.
 
@@ -101,14 +101,14 @@ def get_label_file_path(lab_dir: Path, bmrb_id: str, algo: str, param_str: str) 
     if algo in {"filtered", "filtered_bootstrap"}:
         return lab_dir / f"combined_labels_{bmrb_id}_{param_str}.csv"
     elif algo in {"lda", "lda_bootstrap"}:
-        return lab_dir / f"labels_{bmrb_id}_lda.csv"
+        return lab_dir / f"labels_{bmrb_id}_{algo}_{note}.csv"
     elif algo == "sw":
-        return lab_dir / f"labels_sw_{param_str}.csv"
+        return lab_dir / f"labels_{bmrb_id}_{param_str}.csv"
     else:
         raise ValueError(f"Unsupported algorithm '{algo}' for label file path.")
 
 
-def load_label_data(bmrb_ids: List[str], lab_dir: Path, algo: str, param_str: str) -> Tuple[Dict[str, List[str]], Dict[str, List[str]]]:
+def load_label_data(bmrb_ids: List[str], lab_dir: Path, algo: str, param_str: str, note: str) -> Tuple[Dict[str, List[str]], Dict[str, List[str]]]:
     """
     Load real and predicted labels for a list of BMRB IDs.
 
@@ -124,23 +124,30 @@ def load_label_data(bmrb_ids: List[str], lab_dir: Path, algo: str, param_str: st
     label_check = {}
     label_cv = {}
     for bmrb_id in bmrb_ids:
-        file_path = get_label_file_path(lab_dir, bmrb_id, algo, param_str)
+        file_path = get_label_file_path(lab_dir, bmrb_id, algo, param_str, note)
         df = pd.read_csv(file_path)
         label_check[bmrb_id] = df['real labels'].tolist()
         label_cv[bmrb_id] = df['classified as'].tolist()
     return label_check, label_cv
 
+def format_value(v, eps=1e-12):
+    if v == 0:
+        return "0"
+    elif abs(v) < 0.0005:  # rounds to 0.000
+        return "~0"
+    else:
+        return f"{v:.3f}"
+
+
+def value_color(v):
+    if v == 0:
+        return "red"
+    elif abs(v) < 0.0005:
+        return "orange"
+    return "black"
+
 
 def protein_bar_plot(parameters, label_check, cv_accuracy, output_dir):
-    """
-    Plot stacked bar chart showing accuracy contribution per amino acid for each protein.
-
-    Args:
-        parameters (dict): Parameters dictionary.
-        label_check (dict): Dictionary of real labels per protein.
-        cv_accuracy (dict): Cross-validation accuracies.
-        output_dir (Path): Directory to save the plot.
-    """
     mean_accuracy, std_accuracy = calculate_accuracy_stats(cv_accuracy)
 
     prot = list(label_check.keys())
@@ -152,23 +159,58 @@ def protein_bar_plot(parameters, label_check, cv_accuracy, output_dir):
     sorted_prot = [prot[i] for i in sorted_indices]
     sorted_wxacc = [wxacc[i] for i in sorted_indices]
 
-    fig, ax = plt.subplots()
+    spacing_factor = 2
+    x = np.arange(len(sorted_prot)) * spacing_factor
+    bar_width = 1
+
+    fig, ax = plt.subplots(figsize=(18, 9))
     ax.set_prop_cycle(color=[CM(1.*i/NUM_COLORS) for i in range(NUM_COLORS)])
 
+    # Precompute cumulative sums for stacking (FIXED efficiency)
+    cumulative = np.cumsum(sorted_wxacc, axis=1)
+
+    # stacked bars
     for i, aa in enumerate(ALL_POSSIBLE):
         bar_vals = [w[i] for w in sorted_wxacc]
-        bottoms = [sum(w[:i]) for w in sorted_wxacc] if i > 0 else None
-        ax.bar(sorted_prot, bar_vals, bottom=bottoms, label=aa, edgecolor="black", linewidth=0.5)
+        bottoms = cumulative[:, i-1] if i > 0 else None
 
-    for i, total in enumerate([sum(w) for w in sorted_wxacc]):
-        ax.text(sorted_prot[i], total + 0.01, round(total, 3), ha='center', weight='bold', color='black')
+        bars = ax.bar(
+            x,
+            bar_vals,
+            width=bar_width,
+            bottom=bottoms,
+            label=aa,
+            edgecolor="black",
+            linewidth=0.5
+        )
+
+    import matplotlib.patheffects as pe
+
+    totals = [sum(w) for w in sorted_wxacc]
+
+    for i, total in enumerate(totals):
+        ax.text(
+            x[i], total + 0.02,
+            format_value(total),
+            ha='center',
+            fontsize=8,
+            fontweight='bold',
+            color=value_color(total),
+            path_effects=[pe.withStroke(linewidth=3, foreground="white")]
+        )
+
+    ax.set_xticks(x)
+    ax.set_xticklabels(sorted_prot, rotation=45, ha="right")
 
     ax.set_ylabel('Accuracy')
-    plt.yticks([0.05 * i for i in range(1, 21)])
+    ax.set_yticks([0.05 * i for i in range(1, 21)])
+
+    ax.margins(x=0.03)
     ax.legend(loc='center left', bbox_to_anchor=(1, 0.5))
-    plt.tight_layout()
 
     algo = parameters["algo"]
+    note = parameters["note"]
+
     title_map = {
         "full": "SW Classifier combined",
         "filtered": "SW Classifier combined with filtration",
@@ -178,33 +220,28 @@ def protein_bar_plot(parameters, label_check, cv_accuracy, output_dir):
         "full_bootstrap": "SW Classifier combined with LDA bootstrap",
         "filtered_bootstrap": "SW Classifier combined with filtration and LDA bootstrap"
     }
+
     title_prefix = title_map.get(algo, "Unknown")
     k_str = f"k = {parameters['k']}, " if parameters["k"] else ""
+    proj_str = f"no. projections = {parameters['n_projections']}, " if algo not in ["lda", "lda_bootstrap"] else ""
+
     title = (
-        f"{title_prefix} no. projections = {parameters['n_projections']}, "
+        f"{title_prefix} {proj_str}"
         f"{k_str}average accuracy = {mean_accuracy:.3f} ± {std_accuracy:.3f}"
     )
-    plt.title(title, size=16)
 
-    fig.set_size_inches(16, 6)
+    plt.title(title, size=16)
+    plt.tight_layout()
+
     param_str = build_param_str(parameters)
-    fname = f"validation_protein_bar_plot_{param_str if 'lda' not in algo else algo}.png"
+    fname = f"validation_protein_bar_plot_{param_str if 'lda' not in algo else algo + '_' + note}.png"
     plt.savefig(Path(output_dir) / fname)
     plt.show()
 
 
 def amino_bar_plot(parameters, label_check, cv_dict, cv_accuracy, output_dir):
-    """
-    Plot recall and precision bar charts for amino acids based on predicted vs. real labels.
-
-    Args:
-        parameters (dict): Parameters dictionary.
-        label_check (dict): Dictionary of real labels per protein.
-        cv_dict (dict): Dictionary of predicted labels per protein.
-        cv_accuracy (dict): Cross-validation accuracies.
-        output_dir (Path): Directory to save the plot.
-    """
     mean_accuracy, std_accuracy = calculate_accuracy_stats(cv_accuracy)
+
     amino_ok, amino_all, amino_pred = {}, {}, {}
 
     for amino in ALL_POSSIBLE:
@@ -221,39 +258,51 @@ def amino_bar_plot(parameters, label_check, cv_dict, cv_accuracy, output_dir):
     amino_rec = {aa: amino_ok.get(aa, 0)/amino_all.get(aa, 1) for aa in ALL_POSSIBLE}
     amino_prec = {aa: amino_ok.get(aa, 0)/amino_pred.get(aa, 1) for aa in ALL_POSSIBLE}
 
-    fig, (ax1, ax2) = plt.subplots(2, 1, sharex=True, figsize=(16, 12))
+    fig, (ax1, ax2) = plt.subplots(2, 1, sharex=True, figsize=(18, 12))
 
     key1 = list(amino_rec.keys())
     val1 = list(amino_rec.values())
+
     ax1.set_prop_cycle(color=[CM(1.*i/NUM_COLORS) for i in range(NUM_COLORS)])
-    ax1.bar(key1, val1, edgecolor = "black", linewidth = 0.5, color=[CM(1.*i/NUM_COLORS) for i in range(NUM_COLORS)])
+    ax1.bar(key1, val1, edgecolor="black", linewidth=0.5,
+            color=[CM(1.*i/NUM_COLORS) for i in range(NUM_COLORS)])
 
     for i, total in enumerate(val1):
-        ax1.text(key1[i], total + 0.01, f"{amino_rec[key1[i]]:.3f}",
-                ha='center', weight='bold', color='black')
+        ax1.text(
+            key1[i], total + 0.01,
+            format_value(total),
+            ha='center',
+            weight='bold',
+            color=value_color(total)
+        )
 
     key2 = list(amino_prec.keys())
     val2 = list(amino_prec.values())
+
     ax2.set_prop_cycle(color=[CM(1.*i/NUM_COLORS) for i in range(NUM_COLORS)])
-    ax2.bar(key2, val2, edgecolor = "black", linewidth = 0.5, color=[CM(1.*i/NUM_COLORS) for i in range(NUM_COLORS)])
+    ax2.bar(key2, val2, edgecolor="black", linewidth=0.5,
+            color=[CM(1.*i/NUM_COLORS) for i in range(NUM_COLORS)])
 
     for i, total in enumerate(val2):
-        ax2.text(key2[i], total + 0.01, f"{amino_prec[key2[i]]:.3f}",
-                ha='center', weight='bold', color='black')
+        ax2.text(
+            key2[i], total + 0.01,
+            format_value(total),
+            ha='center',
+            weight='bold',
+            color=value_color(total)
+        )
 
     ax1.set_ylabel('Recall per aminoacid')
-    recall_values = np.array([float(v) for _, v in amino_rec.items()])
-    avg_recall = np.mean(recall_values)
-    std_recall = np.std(recall_values)
-    ax1.set_title(f"Average recall for aminoacids: {avg_recall:.3f}, Std: {std_recall:.3f}")
+    recall_values = np.array(list(amino_rec.values()))
+    ax1.set_title(f"Average recall: {np.mean(recall_values):.3f}, Std: {np.std(recall_values):.3f}")
 
     ax2.set_ylabel('Precision per aminoacid')
-    prec_values = np.array([float(v) for _, v in amino_prec.items()])
-    avg_prec = np.mean(prec_values)
-    std_prec = np.std(prec_values)
-    ax2.set_title(f"Average precision for aminoacids: {avg_prec:.3f}, Std: {std_prec:.3f}")
+    prec_values = np.array(list(amino_prec.values()))
+    ax2.set_title(f"Average precision: {np.mean(prec_values):.3f}, Std: {np.std(prec_values):.3f}")
 
     algo = parameters["algo"]
+    note = parameters["note"]
+
     title_prefix = {
         "full": "SW Classifier combined",
         "filtered": "SW Classifier combined with filtration",
@@ -265,15 +314,18 @@ def amino_bar_plot(parameters, label_check, cv_dict, cv_accuracy, output_dir):
     }.get(algo, "Unknown")
 
     k_str = f"k = {parameters['k']}, " if parameters["k"] else ""
+    proj_str = f"no. projections = {parameters['n_projections']}, " if algo not in ["lda", "lda_bootstrap"] else ""
+
     sup_title = (
-        f"{title_prefix} no. projections = {parameters['n_projections']}, "
+        f"{title_prefix} {proj_str}"
         f"{k_str}average accuracy = {mean_accuracy:.3f} ± {std_accuracy:.3f}"
     )
+
     plt.suptitle(sup_title, size=16)
     plt.yticks([0.05 * i for i in range(1, 21)])
 
     param_str = build_param_str(parameters)
-    fname = f"validation_amino_bar_plot_{param_str if 'lda' not in algo else algo}.png"
+    fname = f"validation_amino_bar_plot_{param_str if 'lda' not in algo else algo + '_' + note}.png"
     plt.savefig(Path(output_dir) / fname)
     plt.show()
 
@@ -289,20 +341,23 @@ def main() -> None:
     config = lib.load_config(args.config_path)
     parameters = lib.prepare_parameters(config)
     algo = parameters["algo"]
+    note = parameters["note"]
     param_str = build_param_str(parameters)
 
     lab_dir, plot_dir = get_output_paths(args.output_dir)
 
     acc_filename = (
-        f"accuracy_validation_{algo}.csv"
-        if algo in {"lda", "lda_bootstrap"}
-        else f"accuracy_validation_combined_{param_str}.csv"
+    f"accuracy_validation_{algo + '_' + note}.csv"
+    if algo in {"lda", "lda_bootstrap"}
+    else f"accuracy_validation_sw_{param_str}.csv"
+    if algo == "sw"
+    else f"accuracy_validation_combined_{param_str}.csv"
     )
     accuracy_file = lab_dir / acc_filename
     cv_accuracy = pd.read_csv(accuracy_file, index_col=0).to_dict()
 
     bmrb_ids = lib.read_bmrb_id(args.id_file)
-    label_check, label_cv = load_label_data(bmrb_ids, lab_dir, algo, param_str)
+    label_check, label_cv = load_label_data(bmrb_ids, lab_dir, algo, param_str, note)
 
     if args.plot_type == "protein_bar":
         protein_bar_plot(parameters, label_check, cv_accuracy, plot_dir)

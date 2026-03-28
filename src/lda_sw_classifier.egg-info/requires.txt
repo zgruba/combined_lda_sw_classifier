@@ -1,0 +1,17 @@
+masserstein @ git+https://github.com/BDomzal/magnetstein.git#egg=547d8b1
+colorcet==3.1.0
+IsoSpecPy==2.2.2
+matplotlib==3.9.1
+numpy==2.0.0
+openpyxl==3.1.5
+pandas==2.2.2
+POT==0.9.4
+PuLP==2.8.0
+pyCirclize==1.6.0
+pynmrstar==3.3.2
+scikit-learn==1.5.1
+scipy==1.14.0
+seaborn==0.13.2
+torch==2.3.1
+toml==0.10.2
+pylint==3.3.6
