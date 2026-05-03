@@ -1132,9 +1132,9 @@ def lda_classification_validate(parameters, protein, scanlist, output_dir) :
         # Classify other residues
         else:
             lda = LDA()
-            train_set_aux = train_t.query('amino!="PRO" or amino!="GLY"')[nuclei_meas].copy()
+            train_set_aux = train_t.query('amino!="PRO" and amino!="GLY"')[nuclei_meas].copy()
             labels = train_labels[
-                np.logical_or(train_labels != "PRO", train_labels != "GLY")
+                np.logical_and(train_labels != "PRO", train_labels != "GLY")
             ].copy()
             idxs = train_set_aux.isnull().any(axis=1)
             train_set_aux = train_set_aux[~idxs]
