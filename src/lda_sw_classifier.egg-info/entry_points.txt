@@ -1,4 +1,0 @@
-[console_scripts]
-lda_sw_classify = lda_sw_classifier.classify:main
-lda_sw_validate = lda_sw_classifier.validate:main
-lda_sw_visualise = lda_sw_classifier.visualise:main
