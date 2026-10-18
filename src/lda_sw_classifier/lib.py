@@ -26,6 +26,10 @@ from pathlib import Path
 
 warnings.filterwarnings("ignore")
 from masserstein import NMRSpectrum, estimate_proportions # pylint: disable=wrong-import-position
+from lda_sw_classifier.temperature import (
+    get_temperature_for_shift_list,
+    correct_temperature_shifts,
+)
 
 
 ALL_POSSIBLE = [
@@ -85,8 +89,11 @@ def prepare_parameters(config):
         "kappa1": config["parameters"]["kappa1"],
         "kappa2": config["parameters"]["kappa2"],
         "note": config["parameters"]["note"],
-        "nuclei": config["parameters"]["nuclei"]
+        "nuclei": config["parameters"]["nuclei"],
+        "temperature_correction": config["parameters"]["temperature_correction"],
+        "reference_temperature": config["parameters"]["reference_temperature"]
     }
+    print(parameters)
     return parameters
 
 def read_bmrb_id(bmrbID_path):
@@ -925,147 +932,274 @@ def find_best_reference(AATs_count, train_t, nuclei, eps):
     return sampled_df
 
 ################################### LDA ########################################
-def lda_classification_validate(parameters, protein, scanlist, output_dir) :
+
+def lda_classification_validate(parameters, protein, scanlist, output_dir):
     content = {}
     algo = parameters["algo"]
     note = parameters["note"]
-    names = ["H", "HB", "HB1", "HB2", "HB3", "CA", "CB", "C", "CO", "N", "amino", "protein"]
+    reference_temperature = parameters["reference_temperature"]
+    temperature_correction = parameters["temperature_correction"]
+
+    names = [
+        "H", "HB", "HB1", "HB2", "HB3",
+        "CA", "CB", "C", "CO", "N",
+        "amino", "protein", "temperature_K",
+    ]
     TableB = pd.DataFrame(columns=names)
 
     for k, l in enumerate(scanlist):
         waiter = True
-        sys.stdout.write(f"\nScanning data from BMRB: {k + 1} of {len(scanlist)}")
+
+        sys.stdout.write(
+            f"\nScanning data from BMRB: {k + 1} of {len(scanlist)}"
+        )
         sys.stdout.flush()
 
         while waiter:
             try:
                 ent = pynmrstar.Entry.from_database(l)
                 waiter = False
-            except (ConnectionError, OSError) as _:
-                print("\nConnection error on: " + str(l))
+            except (ConnectionError, OSError):
+                print(f"\nConnection error on: {l}", flush=True)
                 sleep(2)
-                waiter = True
-        spectral_peaks = ent.get_saveframes_by_category("assigned_chemical_shifts")
 
-        if len(spectral_peaks) > 0:
-            TableC = pd.DataFrame(columns=names)
-            w = spectral_peaks[0]["_Atom_chem_shift.Seq_ID"]
-            x = spectral_peaks[0]["_Atom_chem_shift.Comp_ID"]
-            y = spectral_peaks[0]["_Atom_chem_shift.Atom_ID"]
-            z = spectral_peaks[0]["_Atom_chem_shift.Val"]
-            wp = w[0]
-            n = 0
+        spectral_peaks = ent.get_saveframes_by_category(
+            "assigned_chemical_shifts"
+        )
 
-            for i, j in enumerate(w):
-                if j != wp:
-                    n = n + 1
-                    wp = w[i]
-                TableC.at[n, "protein"] = l
-                TableC.at[n, "amino"] = x[i]
-                TableC.at[n, y[i]] = float(z[i])
-            TableB = pd.concat([TableB, TableC], ignore_index=True)
-    print("\n")
+        if not spectral_peaks:
+            continue
 
-    TableA = pd.DataFrame(
-        columns=["amino", "protein", "HN", "N", "CO", "HA", "HB", "CA", "CB"]
-    ).astype("float")
-    try:
-        TableA["HB"] = TableB.loc[:, "HB":"HB3"].astype(float).mean(axis=1).astype(float)
-    except KeyError:
-        TableA["HB"] = TableB.loc[:, "HB"].astype(float)
+        shift_frame = spectral_peaks[0]
 
-    TableA["HN"] = TableB.loc[:, "H"].astype(float)
-    TableA["CA"] = TableB.loc[:, "CA"].astype(float)
-    TableA["CB"] = TableB.loc[:, "CB"].astype(float)
-    TableA["N"] = TableB.loc[:, "N"].astype(float)
-    TableA["CO"] = TableB.loc[:, "C"].astype(float)
+        temperature_K = get_temperature_for_shift_list(
+            ent,
+            shift_frame,
+        )
 
-    try:
-        TableA["HA"] = TableB.loc[:, ["HA", "HA2", "HA3"]].astype(float).mean(axis=1)
-    except KeyError:
-        try:
-            TableA["HA"] = TableB.loc[:, "HA"].astype(float)
-        except KeyError:
-            pass
+        TableC = pd.DataFrame(columns=names)
 
+        w = shift_frame["_Atom_chem_shift.Seq_ID"]
+        x = shift_frame["_Atom_chem_shift.Comp_ID"]
+        y = shift_frame["_Atom_chem_shift.Atom_ID"]
+        z = shift_frame["_Atom_chem_shift.Val"]
+
+        if not (len(w) == len(x) == len(y) == len(z)):
+            raise ValueError(
+                f"Inconsistent chemical-shift arrays for BMRB {l}: "
+                f"Seq_ID={len(w)}, Comp_ID={len(x)}, "
+                f"Atom_ID={len(y)}, Val={len(z)}"
+            )
+
+        if not w:
+            continue
+
+        wp = w[0]
+        n = 0
+
+        for i, seq_id in enumerate(w):
+            if seq_id != wp:
+                n += 1
+                wp = seq_id
+
+            TableC.at[n, "protein"] = l
+            TableC.at[n, "amino"] = x[i]
+            TableC.at[n, "temperature_K"] = temperature_K
+
+            atom_name = str(y[i]).strip()
+            shift_value = pd.to_numeric(z[i], errors="coerce")
+
+            if pd.isna(shift_value):
+                continue
+
+            if atom_name in names:
+                TableC.at[n, atom_name] = float(shift_value)
+
+        TableB = pd.concat(
+            [TableB, TableC],
+            ignore_index=True,
+        )
+
+    print("\nFinished assembling BMRB data.", flush=True)
+
+    # Assemble residue-level features.
+    TableA = pd.DataFrame(index=TableB.index)
 
     TableA["amino"] = TableB["amino"]
     TableA["protein"] = TableB["protein"]
 
-    AAT_dict = {"A": "ALA", "R": "ARG", "N": "ASN", "D": "ASP", "C": "CYS", "Q": "GLN",
-                "E": "GLU", "G": "GLY", "H": "HIS", "I": "ILE", "L": "LEU", "K": "LYS",
-                "M": "MET", "F": "PHE", "P": "PRO", "S": "SER", "T": "THR", "W": "TRP",
-                "Y": "TYR", "V": "VAL"}
+    # Preserve experimental temperature for every residue.
+    TableA["temperature_K"] = pd.to_numeric(
+        TableB["temperature_K"],
+        errors="coerce",
+    )
 
-    nuclei = parameters["nuclei"]
-    train_data = pd.DataFrame(TableA, columns=nuclei+["amino", "protein"])
+    # Average available beta-proton shifts.
+    hb_columns = ["HB", "HB1", "HB2", "HB3"]
+    TableA["HB"] = TableB[hb_columns].apply(
+        pd.to_numeric, errors="coerce"
+    ).mean(axis=1)
 
-    protein_filter = {}
-    considered = train_data[train_data["protein"].isin(scanlist)]
+    # Map atom names to classifier feature names.
+    TableA["HN"] = pd.to_numeric(
+        TableB["H"], errors="coerce"
+    )
+    TableA["CA"] = pd.to_numeric(
+        TableB["CA"], errors="coerce"
+    )
+    TableA["CB"] = pd.to_numeric(
+        TableB["CB"], errors="coerce"
+    )
+    TableA["N"] = pd.to_numeric(
+        TableB["N"], errors="coerce"
+    )
 
-    check_labels = considered.loc[considered["protein"] == protein, "amino"].values
-    AATs_unique = list(set(check_labels))
+    # The coefficient table must use the exact key "CO".
+    # In BMRB, the carbonyl carbon atom is usually named "C".
+    TableA["CO"] = pd.to_numeric(
+        TableB["C"], errors="coerce"
+    )
 
-    AATs_count = Counter(i for i in check_labels)
+    # Average available alpha-proton shifts.
+    ha_columns = ["HA", "HA2", "HA3"]
+    available_ha_columns = [
+        col for col in ha_columns if col in TableB.columns
+    ]
 
-    AATs_unique.sort()
+    if available_ha_columns:
+        TableA["HA"] = TableB[available_ha_columns].apply(
+            pd.to_numeric, errors="coerce"
+        ).mean(axis=1)
+    else:
+        TableA["HA"] = np.nan
 
-    AATs_missing = list(set(AAT_dict.values()) - set(AATs_unique))
-    data_considered = considered.copy()
-    for AAT in AATs_missing: # pylint: disable=unused-variable
-        data_considered = data_considered.copy().drop(data_considered.query("amino==@AAT").index)
-
-    train_t = data_considered.loc[data_considered["protein"] != protein]
-    test_t = data_considered.loc[data_considered["protein"] == protein]
-
-    for_scaling = pd.concat([test_t, train_t], ignore_index=True)
-    for k in for_scaling:
-        if k in {"amino", "protein"}:
-            break
-        for_scaling[k] = (
-            for_scaling[k] - np.mean(for_scaling[k])) / (np.sqrt(np.std(for_scaling[k]))
+    # Correct chemical shifts before scaling and classification.
+    if temperature_correction:
+        TableA = correct_temperature_shifts(
+            TableA,
+            reference_temperature=reference_temperature,
         )
 
-    test_t = for_scaling.iloc[:len(test_t), :]
-    train_t = for_scaling.iloc[len(test_t):, :]
+    AAT_dict = {
+        "A": "ALA", "R": "ARG", "N": "ASN", "D": "ASP",
+        "C": "CYS", "Q": "GLN", "E": "GLU", "G": "GLY",
+        "H": "HIS", "I": "ILE", "L": "LEU", "K": "LYS",
+        "M": "MET", "F": "PHE", "P": "PRO", "S": "SER",
+        "T": "THR", "W": "TRP", "Y": "TYR", "V": "VAL",
+    }
 
-    # Balancing data using bootstrap resampling
-    train_labels = train_t["amino"].values
+    nuclei = parameters["nuclei"]
 
-    # Combine features and labels for resampling
+    # Only selected nuclei enter the classifier.
+    # Metadata columns remain outside the numerical feature matrix.
+    train_data = TableA[
+        nuclei + ["amino", "protein"]
+    ].copy()
+
+    protein_filter = {}
+    considered = train_data[
+        train_data["protein"].isin(scanlist)
+    ]
+
+    check_labels = considered.loc[
+        considered["protein"] == protein, "amino"
+    ].values
+
+    AATs_unique = sorted(set(check_labels))
+    AATs_count = Counter(check_labels)
+
+    AATs_missing = list(
+        set(AAT_dict.values()) - set(AATs_unique)
+    )
+
+    data_considered = considered.copy()
+
+    for AAT in AATs_missing:
+        data_considered = data_considered.drop(
+            data_considered.query("amino == @AAT").index
+        )
+
+    train_t = data_considered.loc[
+        data_considered["protein"] != protein
+    ].copy()
+
+    test_t = data_considered.loc[
+        data_considered["protein"] == protein
+    ].copy()
+
+    # Scale numerical features. Keep labels and protein IDs unchanged.
+    for_scaling = pd.concat(
+        [test_t, train_t], ignore_index=True
+    )
+
+    for col in nuclei:
+        values = pd.to_numeric(
+            for_scaling[col], errors="coerce"
+        )
+        mean = values.mean()
+        std = values.std(ddof=0)
+
+        if pd.isna(std) or std == 0:
+            for_scaling[col] = values - mean
+        else:
+            for_scaling[col] = (
+                values - mean
+            ) / np.sqrt(std)
+
+    n_test = len(test_t)
+    test_t = for_scaling.iloc[:n_test].copy()
+    train_t = for_scaling.iloc[n_test:].copy()
+
+    # Bootstrap balancing for applicable algorithms.
     train_data = train_t.copy()
-
-    # Separate classes
     balanced_data = []
+
     for amino_acid in train_data["amino"].unique():
-        class_data = train_data[train_data["amino"] == amino_acid]
-        n_samples = train_data["amino"].value_counts().max()  # Target class size
+        class_data = train_data[
+            train_data["amino"] == amino_acid
+        ]
+        n_samples = train_data["amino"].value_counts().max()
+
         balanced_class_data = resample(
             class_data,
-            replace=True,  # Bootstrap resampling
-            n_samples=n_samples,  # Match the largest class
-            random_state=parameters["seed"]
+            replace=True,
+            n_samples=n_samples,
+            random_state=parameters["seed"],
         )
         balanced_data.append(balanced_class_data)
 
-    # Concatenate all balanced class samples
-    balanced_train_data = pd.concat(balanced_data)
+    if balanced_data:
+        balanced_train_data = pd.concat(
+            balanced_data, ignore_index=True
+        )
+    else:
+        balanced_train_data = train_t.copy()
 
-    test_drop = test_t.copy().drop(columns=["amino", "protein"])
-
-    nuclei = test_drop.columns.tolist()
-    test_t = test_t.dropna(subset=nuclei, how="all")
-    train_t = train_t.dropna(subset=nuclei, how="all")
+    test_t = test_t.dropna(
+        subset=nuclei, how="all"
+    )
+    train_t = train_t.dropna(
+        subset=nuclei, how="all"
+    )
 
     if algo in ["lda_bootstrap", "filtered_bootstrap"]:
-        train_t = balanced_train_data.dropna(subset=nuclei, how="all")
+        train_t = balanced_train_data.dropna(
+            subset=nuclei, how="all"
+        )
 
-    train_labels = train_t.loc[train_t["protein"] != protein, "amino"].values
-    check_labels = test_t.loc[test_t["protein"] == protein, "amino"].values
+    train_labels = train_t.loc[
+        train_t["protein"] != protein, "amino"
+    ].values
 
+    check_labels = test_t.loc[
+        test_t["protein"] == protein, "amino"
+    ].values
 
     test_lab = [None for _ in range(test_t.shape[0])]
-    probs = np.ndarray(shape=(len(test_lab), len(AATs_unique)))
+    probs = np.ndarray(
+        shape=(len(test_lab), len(AATs_unique))
+    )
+
     test_nan = np.array(test_t.isnull())
     combs_nan = np.unique(test_nan, axis=0)
 
@@ -1077,68 +1211,102 @@ def lda_classification_validate(parameters, protein, scanlist, output_dir) :
         content["count_rest"] = AATs_count
         return content
 
-    # Get column positions of GLY and PRO
+    # Get column positions of GLY and PRO.
     if "GLY" in AATs_unique:
         G_idx = AATs_unique.index("GLY")
     if "PRO" in AATs_unique:
         P_idx = AATs_unique.index("PRO")
-    # Loop over combinations
+
+    # Loop over combinations of missing nuclei.
     for i in combs_nan:
         idxs_nan = np.all(test_nan == i, axis=1)
         nuclei_meas = list(compress(nuclei, ~i))
-        test_missing_comb = test_t[idxs_nan][nuclei_meas]
+        test_missing_comb = test_t.loc[
+            idxs_nan, nuclei_meas
+        ]
 
-        # Classify residues with all NaN values
         if np.all(i):
-            a = np.empty((idxs_nan.sum(), probs.shape[1]))
+            a = np.empty(
+                (idxs_nan.sum(), probs.shape[1])
+            )
             a[:] = np.nan
             probs[idxs_nan, :] = a
             continue
 
-        # Classify residues that could be GLY or PRO
-        if {"HB", "CB", "HN"}.isdisjoint(nuclei_meas) and all(
-                x in AATs_unique for x in ["GLY", "PRO"]):
+        # Residues that could be GLY or PRO.
+        if (
+            {"HB", "CB", "HN"}.isdisjoint(nuclei_meas)
+            and all(x in AATs_unique for x in ["GLY", "PRO"])
+        ):
             lda = LDA()
             idxs = train_t[nuclei_meas].isnull().any(axis=1)
-            train_set_aux = train_t[~idxs][nuclei_meas].copy()
+            train_set_aux = train_t.loc[
+                ~idxs, nuclei_meas
+            ].copy()
             labels = train_labels[~idxs].copy()
 
             lda.fit(train_set_aux, labels)
             lda.means_ = 1
-            probs[idxs_nan, :] = lda.predict_proba(test_missing_comb)
-            test_labels = list(lda.predict(test_missing_comb))
+            probs[idxs_nan, :] = lda.predict_proba(
+                test_missing_comb
+            )
+            test_labels = list(
+                lda.predict(test_missing_comb)
+            )
+
             for idx, val in enumerate(idxs_nan):
                 if val:
                     test_lab[idx] = test_labels.pop(0)
 
-        # Classify residues that could be GLY
-        elif {"HB", "CB"}.isdisjoint(set(nuclei_meas)) and "GLY" in AATs_unique:
+        # Residues that could be GLY.
+        elif (
+            {"HB", "CB"}.isdisjoint(set(nuclei_meas))
+            and "GLY" in AATs_unique
+        ):
             lda = LDA()
-            train_set_aux = train_t[train_t["amino"] != "PRO"][nuclei_meas].copy()
-            labels = train_labels[train_labels != "PRO"].copy()
+            train_set_aux = train_t.loc[
+                train_t["amino"] != "PRO", nuclei_meas
+            ].copy()
+            labels = train_labels[
+                train_labels != "PRO"
+            ].copy()
+
             idxs = train_set_aux.isnull().any(axis=1)
-            train_set_aux = train_set_aux[~idxs]
+            train_set_aux = train_set_aux.loc[~idxs]
             labels = labels[~idxs]
+
             lda.fit(train_set_aux, labels)
             probs_aux = lda.predict_proba(test_missing_comb)
             test_labels = list(lda.predict(test_missing_comb))
+
             if "PRO" in AATs_unique:
-                probs[idxs_nan, :] = np.c_[probs_aux[:, :P_idx],
-                    np.zeros((idxs_nan.sum(), 1)), probs_aux[:, P_idx:]
+                probs[idxs_nan, :] = np.c_[
+                    probs_aux[:, :P_idx],
+                    np.zeros((idxs_nan.sum(), 1)),
+                    probs_aux[:, P_idx:],
                 ]
             else:
                 probs[idxs_nan, :] = probs_aux
+
             for idx, val in enumerate(idxs_nan):
                 if val:
                     test_lab[idx] = test_labels.pop(0)
 
-        # Classify residues that could be PRO
-        elif {"HN"}.isdisjoint(set(nuclei_meas)) and "PRO" in AATs_unique:
+        # Residues that could be PRO.
+        elif (
+            {"HN"}.isdisjoint(set(nuclei_meas))
+            and "PRO" in AATs_unique
+        ):
             lda = LDA()
-            train_set_aux = train_t[train_t["amino"] != "GLY"][nuclei_meas].copy()
-            labels = train_labels[train_labels != "GLY"].copy()
+            train_set_aux = train_t.loc[
+                train_t["amino"] != "GLY", nuclei_meas
+            ].copy()
+            labels = train_labels[
+                train_labels != "GLY"
+            ].copy()
+
             idxs = train_set_aux.isnull().any(axis=1)
-            train_set_aux = train_set_aux[~idxs]
+            train_set_aux = train_set_aux.loc[~idxs]
             labels = labels[~idxs]
 
             lda.fit(train_set_aux, labels)
@@ -1147,241 +1315,430 @@ def lda_classification_validate(parameters, protein, scanlist, output_dir) :
 
             if "PRO" not in set(AATs_unique).difference(set(labels)):
                 if "GLY" in AATs_unique:
-                    probs[idxs_nan, :] = np.c_[probs_aux[:, :G_idx],
-                        np.zeros((idxs_nan.sum(), 1)), probs_aux[:, G_idx:]
+                    probs[idxs_nan, :] = np.c_[
+                        probs_aux[:, :G_idx],
+                        np.zeros((idxs_nan.sum(), 1)),
+                        probs_aux[:, G_idx:],
                     ]
                 else:
                     probs[idxs_nan, :] = probs_aux
             else:
                 if "GLY" in AATs_unique:
-                    probs[idxs_nan, :] = np.c_[probs_aux[:, :G_idx],
-                        np.zeros((idxs_nan.sum(), 1)), probs_aux[:, G_idx:P_idx - 1],
-                        np.zeros((idxs_nan.sum(), 1)), probs_aux[:, P_idx - 1:]
+                    probs[idxs_nan, :] = np.c_[
+                        probs_aux[:, :G_idx],
+                        np.zeros((idxs_nan.sum(), 1)),
+                        probs_aux[:, G_idx:P_idx - 1],
+                        np.zeros((idxs_nan.sum(), 1)),
+                        probs_aux[:, P_idx - 1:],
                     ]
                 else:
-                    probs[idxs_nan, :] = np.c_[probs_aux[:, :P_idx],
-                        np.zeros((idxs_nan.sum(), 1)), probs_aux[:, P_idx:]
+                    probs[idxs_nan, :] = np.c_[
+                        probs_aux[:, :P_idx],
+                        np.zeros((idxs_nan.sum(), 1)),
+                        probs_aux[:, P_idx:],
                     ]
 
             for idx, val in enumerate(idxs_nan):
                 if val:
                     test_lab[idx] = test_labels.pop(0)
 
-        # Classify other residues
+        # Other residues.
         else:
             lda = LDA()
-            train_set_aux = train_t.query('amino!="PRO" and amino!="GLY"')[nuclei_meas].copy()
+            train_set_aux = train_t.query(
+                'amino != "PRO" and amino != "GLY"'
+            )[nuclei_meas].copy()
+
             labels = train_labels[
-                np.logical_and(train_labels != "PRO", train_labels != "GLY")
+                np.logical_and(
+                    train_labels != "PRO",
+                    train_labels != "GLY",
+                )
             ].copy()
+
             idxs = train_set_aux.isnull().any(axis=1)
-            train_set_aux = train_set_aux[~idxs]
+            train_set_aux = train_set_aux.loc[~idxs]
             labels = labels[~idxs]
 
             lda.fit(train_set_aux, labels)
             probs_aux = lda.predict_proba(test_missing_comb)
             test_labels = list(lda.predict(test_missing_comb))
+
             if all(x in AATs_unique for x in ["GLY", "PRO"]):
-                probs[idxs_nan, :] = np.c_[probs_aux[:, :G_idx], np.zeros((idxs_nan.sum(), 1)),
-                    probs_aux[:, G_idx:P_idx - 1], np.zeros((idxs_nan.sum(), 1)),
-                    probs_aux[:, P_idx - 1:]
+                probs[idxs_nan, :] = np.c_[
+                    probs_aux[:, :G_idx],
+                    np.zeros((idxs_nan.sum(), 1)),
+                    probs_aux[:, G_idx:P_idx - 1],
+                    np.zeros((idxs_nan.sum(), 1)),
+                    probs_aux[:, P_idx - 1:],
                 ]
             elif "PRO" in AATs_unique:
-                probs[idxs_nan, :] = np.c_[probs_aux[:, :P_idx],
-                    np.zeros((idxs_nan.sum(), 1)), probs_aux[:, P_idx:]
+                probs[idxs_nan, :] = np.c_[
+                    probs_aux[:, :P_idx],
+                    np.zeros((idxs_nan.sum(), 1)),
+                    probs_aux[:, P_idx:],
                 ]
             elif "GLY" in AATs_unique:
-                probs[idxs_nan, :] = np.c_[probs_aux[:, :G_idx],
-                    np.zeros((idxs_nan.sum(), 1)), probs_aux[:, G_idx:]
+                probs[idxs_nan, :] = np.c_[
+                    probs_aux[:, :G_idx],
+                    np.zeros((idxs_nan.sum(), 1)),
+                    probs_aux[:, G_idx:],
                 ]
             else:
                 probs[idxs_nan, :] = probs_aux
+
             for idx, val in enumerate(idxs_nan):
                 if val:
                     test_lab[idx] = test_labels.pop(0)
 
-    df_probs = pd.DataFrame(probs, index=test_t.index, columns=AATs_unique)
-    df_protein = pd.DataFrame({"real labels": check_labels, "classified as": test_lab, "LDA score": df_probs.max(axis=1).values})
+    df_probs = pd.DataFrame(
+        probs, index=test_t.index, columns=AATs_unique
+    )
+
+    df_protein = pd.DataFrame({
+        "real labels": check_labels,
+        "classified as": test_lab,
+        "LDA score": df_probs.max(axis=1).values,
+    })
+
     content["train"] = train_t
     content["test"] = test_t
     content["check_labels"] = check_labels
     content["train_labels"] = train_labels
     content["lda_labels"] = df_protein
     content["lda_probs"] = df_probs
-    content["lda_accuracy"] = accuracy(check_labels, test_lab)
+    content["lda_accuracy"] = accuracy(
+        check_labels, test_lab
+    )
 
     if algo in ["lda", "lda_bootstrap"]:
-        df_protein.to_csv(Path(output_dir) / f"labels_{protein}_{algo}_{note}.csv")
-        df_probs.to_csv(Path(output_dir) / f"probabilities_{protein}_{algo}_{note}.csv")
+        df_protein.to_csv(
+            Path(output_dir)
+            / f"labels_{protein}_{algo}_{note}.csv"
+        )
+        df_probs.to_csv(
+            Path(output_dir)
+            / f"probabilities_{protein}_{algo}_{note}.csv"
+        )
 
     if algo in ["filtered", "filtered_bootstrap"]:
-        fltr =  [i
+        fltr = [
+            i
             for i, a in enumerate(AATs_unique)
-            if AATs_count.get(a, 0)/len(check_labels) > 0.01
+            if AATs_count.get(a, 0) / len(check_labels) > 0.01
         ]
-        protein_filter[protein] = probs[:, fltr].max(axis=1) == 1
-        filter_p = pd.DataFrame(protein_filter[protein], columns=[f"{protein}"], )
+        protein_filter[protein] = (
+            probs[:, fltr].max(axis=1) == 1
+        )
+        filter_p = pd.DataFrame(
+            protein_filter[protein],
+            columns=[f"{protein}"],
+        )
         content["filter"] = filter_p
         content["count_rest"] = AATs_count - Counter(
-            [lab for i, lab in enumerate(test_lab) if protein_filter[protein][i]]
+            [
+                lab
+                for i, lab in enumerate(test_lab)
+                if protein_filter[protein][i]
+            ]
         )
+
     return content
 
 
 ################################### LDA CLASSIFY ###############################
 
+
 def lda_classification_classify(
     parameters, excel_protein, scanlist, fasta_path, output_dir
-) :
+):
     with open(fasta_path, "r") as f:
-        fasta = [line.rstrip("\n") for line in f]
-    fasta = "".join(fasta)
+        fasta = "".join(line.strip() for line in f)
+
     content = {}
     algo = parameters["algo"]
     note = parameters["note"]
-    names = ["H", "HB", "HB1", "HB2", "HB3", "CA", "CB", "C", "CO", "N", "amino", "protein"]
+    reference_temperature = parameters["reference_temperature"]
+    temperature_correction = parameters["temperature_correction"]
+
+    names = [
+        "H", "HB", "HB1", "HB2", "HB3",
+        "CA", "CB", "C", "CO", "N",
+        "amino", "protein", "temperature_K",
+    ]
 
     test_data = pd.read_excel(excel_protein, engine="openpyxl")
     TableB = pd.DataFrame(columns=names)
 
+    # ---------------------------------------------------------
+    # 1. Download BMRB entries and preserve their temperatures.
+    # ---------------------------------------------------------
     for k, l in enumerate(scanlist):
         waiter = True
-        sys.stdout.write(f"\nScanning data from BMRB: {k + 1} of {len(scanlist)}")
+
+        sys.stdout.write(
+            f"\nScanning data from BMRB: {k + 1} of {len(scanlist)}"
+        )
         sys.stdout.flush()
 
         while waiter:
             try:
                 ent = pynmrstar.Entry.from_database(l)
                 waiter = False
-            except (ConnectionError, OSError) as _:
-                print("\nConnection error on: " + str(l))
+            except (ConnectionError, OSError):
+                print(f"\nConnection error on: {l}", flush=True)
                 sleep(2)
-                waiter = True
-        spectral_peaks = ent.get_saveframes_by_category("assigned_chemical_shifts")
 
-        if len(spectral_peaks) > 0:
-            TableC = pd.DataFrame(columns=names)
-            w = spectral_peaks[0]["_Atom_chem_shift.Seq_ID"]
-            x = spectral_peaks[0]["_Atom_chem_shift.Comp_ID"]
-            y = spectral_peaks[0]["_Atom_chem_shift.Atom_ID"]
-            z = spectral_peaks[0]["_Atom_chem_shift.Val"]
-            wp = w[0]
-            n = 0
+        spectral_peaks = ent.get_saveframes_by_category(
+            "assigned_chemical_shifts"
+        )
 
-            for i, j in enumerate(w):
-                if j != wp:
-                    n = n + 1
-                    wp = w[i]
-                TableC.at[n, "protein"] = l
-                TableC.at[n, "amino"] = x[i]
-                TableC.at[n, y[i]] = float(z[i])
-            TableB = pd.concat([TableB, TableC], ignore_index=True)
-    print("\n")
-    TableA = pd.DataFrame(
-        columns=["amino", "protein", "HN", "N", "CO", "HA", "HB", "CA", "CB"]
-    ).astype("float")
-    try:
-        TableA["HB"] = TableB.loc[:, "HB":"HB3"].astype(float).mean(axis=1).astype(float)
-    except KeyError:
-        TableA["HB"] = TableB.loc[:, "HB"].astype(float)
+        if not spectral_peaks:
+            continue
 
-    TableA["HN"] = TableB.loc[:, "H"].astype(float)
-    TableA["CA"] = TableB.loc[:, "CA"].astype(float)
-    TableA["CB"] = TableB.loc[:, "CB"].astype(float)
-    TableA["N"] = TableB.loc[:, "N"].astype(float)
-    TableA["CO"] = TableB.loc[:, "C"].astype(float)
+        shift_frame = spectral_peaks[0]
 
-    try:
-        TableA["HA"] = TableB.loc[:, ["HA", "HA2", "HA3"]].astype(float).mean(axis=1)
-    except KeyError:
-        try:
-            TableA["HA"] = TableB.loc[:, "HA"].astype(float)
-        except KeyError:
-            pass
+        temperature_K = get_temperature_for_shift_list(
+            ent,
+            shift_frame,
+        )
+
+        TableC = pd.DataFrame(columns=names)
+
+        w = shift_frame["_Atom_chem_shift.Seq_ID"]
+        x = shift_frame["_Atom_chem_shift.Comp_ID"]
+        y = shift_frame["_Atom_chem_shift.Atom_ID"]
+        z = shift_frame["_Atom_chem_shift.Val"]
+
+        if not (len(w) == len(x) == len(y) == len(z)):
+            raise ValueError(
+                f"Inconsistent chemical-shift arrays for BMRB {l}: "
+                f"Seq_ID={len(w)}, Comp_ID={len(x)}, "
+                f"Atom_ID={len(y)}, Val={len(z)}"
+            )
+
+        if not w:
+            continue
+
+        wp = w[0]
+        n = 0
+
+        for i, seq_id in enumerate(w):
+            if seq_id != wp:
+                n += 1
+                wp = seq_id
+
+            TableC.at[n, "protein"] = l
+            TableC.at[n, "amino"] = x[i]
+            TableC.at[n, "temperature_K"] = temperature_K
+
+            atom_name = str(y[i]).strip()
+            shift_value = pd.to_numeric(z[i], errors="coerce")
+
+            if pd.isna(shift_value):
+                continue
+
+            if atom_name in names:
+                TableC.at[n, atom_name] = float(shift_value)
+
+        TableB = pd.concat(
+            [TableB, TableC],
+            ignore_index=True,
+        )
+
+    # ---------------------------------------------------------
+    # 2. Assemble residue-level features and preserve metadata.
+    # ---------------------------------------------------------
+    TableA = pd.DataFrame(index=TableB.index)
 
     TableA["amino"] = TableB["amino"]
     TableA["protein"] = TableB["protein"]
-
-    AAT_dict = {"A": "ALA", "R": "ARG", "N": "ASN", "D": "ASP", "C": "CYS", "Q": "GLN",
-                "E": "GLU", "G": "GLY", "H": "HIS", "I": "ILE", "L": "LEU", "K": "LYS",
-                "M": "MET", "F": "PHE", "P": "PRO", "S": "SER", "T": "THR", "W": "TRP",
-                "Y": "TYR", "V": "VAL"}
-
-    # Get Amino Acid Types in test protein from seq file
-    AATs_unique = list({AAT_dict[x] for x in set(fasta)})
-    AATs_unique.sort()
-
-    check_labels = pd.Series([None for _ in test_data["SSN"].values])
-
-    # Eliminate from training set residues of AATs not present in test protein
-    AATs_missing = list(set(AAT_dict.values()) - set(AATs_unique))
-    # print(len(AATs_unique))
-
-    AATs_count = Counter([AAT_dict[x] for x in fasta])
-
-    # Test data
-    SSN = test_data.iloc[:len(test_data), 0]
-    test_set = test_data.drop(["SSN"], axis=1)
-    nuclei = test_set.columns.tolist()
-    nuclei.remove("amino")
-
-    # Sort training data
-    train_data = pd.DataFrame(
-        TableA, columns=nuclei+["amino", "protein"]).sort_values(["amino"], ascending=True
+    TableA["temperature_K"] = pd.to_numeric(
+        TableB["temperature_K"],
+        errors="coerce",
     )
 
-    for AAT in AATs_missing: # pylint: disable=unused-variable
-        train_data = train_data.drop(train_data.query("amino==@AAT").index)
+    # Average beta-proton shifts.
+    hb_columns = ["HB", "HB1", "HB2", "HB3"]
+    TableA["HB"] = TableB[hb_columns].apply(
+        pd.to_numeric, errors="coerce"
+    ).mean(axis=1)
 
-    # Pareto scaling of train and test data simultaneously
-    for_scaling = pd.concat([test_set, train_data], ignore_index=True)
-    for k in for_scaling:
-        if k in {"amino", "protein"}:
-            break
-        for_scaling[k] = (
-            for_scaling[k] - np.mean(for_scaling[k])) / (np.sqrt(np.std(for_scaling[k]))
+    TableA["HN"] = pd.to_numeric(
+        TableB["H"], errors="coerce"
+    )
+    TableA["CA"] = pd.to_numeric(
+        TableB["CA"], errors="coerce"
+    )
+    TableA["CB"] = pd.to_numeric(
+        TableB["CB"], errors="coerce"
+    )
+    TableA["N"] = pd.to_numeric(
+        TableB["N"], errors="coerce"
+    )
+
+    # BMRB atom name C is the carbonyl carbon.
+    TableA["CO"] = pd.to_numeric(
+        TableB["C"], errors="coerce"
+    )
+
+    # Average available alpha-proton shifts.
+    ha_columns = ["HA", "HA2", "HA3"]
+    TableA["HA"] = TableB[ha_columns].apply(
+        pd.to_numeric, errors="coerce"
+    ).mean(axis=1)
+
+    # ---------------------------------------------------------
+    # 3. Correct training shifts before feature scaling.
+    # ---------------------------------------------------------
+    if temperature_correction:
+        TableA = correct_temperature_shifts(
+            TableA,
+            reference_temperature=reference_temperature,
         )
 
+    # The temperature metadata is deliberately not a classifier feature.
+    AAT_dict = {
+        "A": "ALA", "R": "ARG", "N": "ASN", "D": "ASP",
+        "C": "CYS", "Q": "GLN", "E": "GLU", "G": "GLY",
+        "H": "HIS", "I": "ILE", "L": "LEU", "K": "LYS",
+        "M": "MET", "F": "PHE", "P": "PRO", "S": "SER",
+        "T": "THR", "W": "TRP", "Y": "TYR", "V": "VAL",
+    }
 
-    test_t = for_scaling.iloc[:len(test_data), :]
-    train_t = for_scaling.iloc[len(test_data):, :]
+    # Amino-acid types expected in the FASTA sequence.
+    fasta = fasta.upper()
+    invalid_residues = sorted(set(fasta) - set(AAT_dict))
 
-    # Balancing data using bootstrap resampling
+    if invalid_residues:
+        raise ValueError(
+            f"FASTA contains unsupported amino-acid symbols: "
+            f"{invalid_residues}"
+        )
+
+    AATs_unique = sorted({AAT_dict[aa] for aa in set(fasta)})
+    AATs_count = Counter(AAT_dict[aa] for aa in fasta)
+
+    # Test data: SSN identifies the residue; amino is a label column
+    # if present in the supplied spreadsheet.
+    SSN = test_data.iloc[:, 0]
+    check_labels = pd.Series(
+        [None] * len(test_data),
+        index=test_data.index,
+    )
+
+    test_set = test_data.drop(columns=["SSN"]).copy()
+
+    if "amino" not in test_set.columns:
+        raise ValueError(
+            "The Excel test data must contain an 'amino' column "
+            "for compatibility with the current classification pipeline."
+        )
+
+    nuclei = [
+        col for col in test_set.columns
+        if col not in {"amino", "protein", "temperature_K"}
+    ]
+
+    # Only use the selected test nuclei as classifier features.
+    missing_features = [
+        col for col in nuclei if col not in TableA.columns
+    ]
+    if missing_features:
+        raise ValueError(
+            f"Test features are not available in the BMRB training data: "
+            f"{missing_features}"
+        )
+
+    # Sort training data by amino-acid type, matching the original workflow.
+    train_data = TableA[
+        nuclei + ["amino", "protein"]
+    ].sort_values("amino", ascending=True).copy()
+
+    # Remove training classes absent from the FASTA sequence.
+    AATs_missing = list(set(AAT_dict.values()) - set(AATs_unique))
+
+    for AAT in AATs_missing:
+        train_data = train_data.drop(
+            train_data.query("amino == @AAT").index
+        )
+
+    # ---------------------------------------------------------
+    # 4. Scale training and test features together.
+    # ---------------------------------------------------------
+    # IMPORTANT: this retains the original scaling formula.
+    # It assumes the Excel test features are already on the same
+    # reference-temperature basis as the corrected training features.
+    for_scaling = pd.concat(
+        [test_set, train_data],
+        ignore_index=True,
+    )
+
+    for col in nuclei:
+        values = pd.to_numeric(
+            for_scaling[col], errors="coerce"
+        )
+        mean = values.mean()
+        std = values.std(ddof=0)
+
+        if pd.isna(std) or std == 0:
+            for_scaling[col] = values - mean
+        else:
+            for_scaling[col] = (
+                values - mean
+            ) / np.sqrt(std)
+
+    n_test = len(test_data)
+    test_t = for_scaling.iloc[:n_test].copy()
+    train_t = for_scaling.iloc[n_test:].copy()
+
+    # ---------------------------------------------------------
+    # 5. Balance training data using bootstrap resampling.
+    # ---------------------------------------------------------
     train_labels = train_t["amino"].values
-
-    # Combine features and labels for resampling
-    train_data = train_t.copy()
-
-    # Separate classes
     balanced_data = []
-    for amino_acid in train_data["amino"].unique():
-        class_data = train_data[train_data["amino"] == amino_acid]
-        n_samples = train_data["amino"].value_counts().max()  # Target class size
+
+    for amino_acid in train_t["amino"].unique():
+        class_data = train_t[
+            train_t["amino"] == amino_acid
+        ]
+
+        n_samples = train_t["amino"].value_counts().max()
+
         balanced_class_data = resample(
             class_data,
-            replace=True,  # Bootstrap resampling
-            n_samples=n_samples,  # Match the largest class
-            random_state=parameters["seed"]
+            replace=True,
+            n_samples=n_samples,
+            random_state=parameters["seed"],
         )
         balanced_data.append(balanced_class_data)
 
-    # Concatenate all balanced class samples
-    balanced_train_data = pd.concat(balanced_data)
+    balanced_train_data = (
+        pd.concat(balanced_data, ignore_index=True)
+        if balanced_data
+        else train_t.copy()
+    )
 
-    test_drop = test_t.copy().drop(columns=["amino", "protein"])
-
-    nuclei = test_drop.columns.tolist()
+    # Drop residues that have no measured classifier features.
     test_t = test_t.dropna(subset=nuclei, how="all")
     train_t = train_t.dropna(subset=nuclei, how="all")
 
     if algo in ["lda_bootstrap", "filtered_bootstrap"]:
-        train_t = balanced_train_data.dropna(subset=nuclei, how="all")
+        train_t = balanced_train_data.dropna(
+            subset=nuclei, how="all"
+        )
 
     train_labels = train_t["amino"].values
 
+    # Align the unknown test labels to the rows retained for prediction.
+    check_labels = check_labels.loc[test_t.index].values
+
     test_lab = [None for _ in range(test_t.shape[0])]
-    probs = np.ndarray(shape=(len(test_lab), len(AATs_unique)))
-    test_nan = np.array(test_t.isnull())
+    probs = np.ndarray(
+        shape=(len(test_lab), len(AATs_unique))
+    )
+
+    test_nan = np.array(test_t[nuclei].isnull())
     combs_nan = np.unique(test_nan, axis=0)
 
     if algo == "sw":
@@ -1392,69 +1749,104 @@ def lda_classification_classify(
         content["count_rest"] = AATs_count
         return content
 
-    # Get column positions of GLY and PRO
+    # Get column positions of GLY and PRO.
     if "GLY" in AATs_unique:
         G_idx = AATs_unique.index("GLY")
     if "PRO" in AATs_unique:
         P_idx = AATs_unique.index("PRO")
-    # Loop over combinations
+
+    # ---------------------------------------------------------
+    # 6. Classification for each pattern of missing nuclei.
+    # ---------------------------------------------------------
     for i in combs_nan:
         idxs_nan = np.all(test_nan == i, axis=1)
         nuclei_meas = list(compress(nuclei, ~i))
-        test_missing_comb = test_t[idxs_nan][nuclei_meas]
+        test_missing_comb = test_t.loc[idxs_nan, nuclei_meas]
 
-        # Classify residues with all NaN values
+        # All features are missing.
         if np.all(i):
-            a = np.empty((idxs_nan.sum(), probs.shape[1]))
+            a = np.empty(
+                (idxs_nan.sum(), probs.shape[1])
+            )
             a[:] = np.nan
             probs[idxs_nan, :] = a
             continue
 
-        # Classify residues that could be GLY or PRO
-        if {"HB", "CB", "HN"}.isdisjoint(nuclei_meas) and all(
-                x in AATs_unique for x in ["GLY", "PRO"]):
+        # Residues that could be GLY or PRO.
+        if (
+            {"HB", "CB", "HN"}.isdisjoint(nuclei_meas)
+            and all(x in AATs_unique for x in ["GLY", "PRO"])
+        ):
             lda = LDA()
             idxs = train_t[nuclei_meas].isnull().any(axis=1)
-            train_set_aux = train_t[~idxs][nuclei_meas].copy()
+            train_set_aux = train_t.loc[
+                ~idxs, nuclei_meas
+            ].copy()
             labels = train_labels[~idxs].copy()
 
             lda.fit(train_set_aux, labels)
             lda.means_ = 1
-            probs[idxs_nan, :] = lda.predict_proba(test_missing_comb)
-            test = test_missing_comb.values
-            test_labels = list(lda.predict(test_missing_comb))
+
+            probs[idxs_nan, :] = lda.predict_proba(
+                test_missing_comb
+            )
+            test_labels = list(
+                lda.predict(test_missing_comb)
+            )
+
             for idx, val in enumerate(idxs_nan):
                 if val:
                     test_lab[idx] = test_labels.pop(0)
 
-        # Classify residues that could be GLY
-        elif {"HB", "CB"}.isdisjoint(set(nuclei_meas)) and "GLY" in AATs_unique:
+        # Residues that could be GLY.
+        elif (
+            {"HB", "CB"}.isdisjoint(nuclei_meas)
+            and "GLY" in AATs_unique
+        ):
             lda = LDA()
-            train_set_aux = train_t[train_t["amino"] != "PRO"][nuclei_meas].copy()
-            labels = train_labels[train_labels != "PRO"].copy()
+            train_set_aux = train_t.loc[
+                train_t["amino"] != "PRO", nuclei_meas
+            ].copy()
+            labels = train_labels[
+                train_labels != "PRO"
+            ].copy()
+
             idxs = train_set_aux.isnull().any(axis=1)
-            train_set_aux = train_set_aux[~idxs]
+            train_set_aux = train_set_aux.loc[~idxs]
             labels = labels[~idxs]
+
             lda.fit(train_set_aux, labels)
             probs_aux = lda.predict_proba(test_missing_comb)
             test_labels = list(lda.predict(test_missing_comb))
+
             if "PRO" in AATs_unique:
-                probs[idxs_nan, :] = np.c_[probs_aux[:, :P_idx],
-                    np.zeros((idxs_nan.sum(), 1)), probs_aux[:, P_idx:]
+                probs[idxs_nan, :] = np.c_[
+                    probs_aux[:, :P_idx],
+                    np.zeros((idxs_nan.sum(), 1)),
+                    probs_aux[:, P_idx:],
                 ]
             else:
                 probs[idxs_nan, :] = probs_aux
+
             for idx, val in enumerate(idxs_nan):
                 if val:
                     test_lab[idx] = test_labels.pop(0)
 
-        # Classify residues that could be PRO
-        elif {"HN"}.isdisjoint(set(nuclei_meas)) and "PRO" in AATs_unique:
+        # Residues that could be PRO.
+        elif (
+            {"HN"}.isdisjoint(nuclei_meas)
+            and "PRO" in AATs_unique
+        ):
             lda = LDA()
-            train_set_aux = train_t[train_t["amino"] != "GLY"][nuclei_meas].copy()
-            labels = train_labels[train_labels != "GLY"].copy()
+            train_set_aux = train_t.loc[
+                train_t["amino"] != "GLY", nuclei_meas
+            ].copy()
+            labels = train_labels[
+                train_labels != "GLY"
+            ].copy()
+
             idxs = train_set_aux.isnull().any(axis=1)
-            train_set_aux = train_set_aux[~idxs]
+            train_set_aux = train_set_aux.loc[~idxs]
             labels = labels[~idxs]
 
             lda.fit(train_set_aux, labels)
@@ -1463,84 +1855,140 @@ def lda_classification_classify(
 
             if "PRO" not in set(AATs_unique).difference(set(labels)):
                 if "GLY" in AATs_unique:
-                    probs[idxs_nan, :] = np.c_[probs_aux[:, :G_idx],
-                        np.zeros((idxs_nan.sum(), 1)), probs_aux[:, G_idx:]
+                    probs[idxs_nan, :] = np.c_[
+                        probs_aux[:, :G_idx],
+                        np.zeros((idxs_nan.sum(), 1)),
+                        probs_aux[:, G_idx:],
                     ]
                 else:
                     probs[idxs_nan, :] = probs_aux
             else:
                 if "GLY" in AATs_unique:
-                    probs[idxs_nan, :] = np.c_[probs_aux[:, :G_idx],
-                        np.zeros((idxs_nan.sum(), 1)), probs_aux[:, G_idx:P_idx - 1],
-                        np.zeros((idxs_nan.sum(), 1)), probs_aux[:, P_idx - 1:]
+                    probs[idxs_nan, :] = np.c_[
+                        probs_aux[:, :G_idx],
+                        np.zeros((idxs_nan.sum(), 1)),
+                        probs_aux[:, G_idx:P_idx - 1],
+                        np.zeros((idxs_nan.sum(), 1)),
+                        probs_aux[:, P_idx - 1:],
                     ]
                 else:
-                    probs[idxs_nan, :] = np.c_[probs_aux[:, :P_idx],
-                        np.zeros((idxs_nan.sum(), 1)), probs_aux[:, P_idx:]
+                    probs[idxs_nan, :] = np.c_[
+                        probs_aux[:, :P_idx],
+                        np.zeros((idxs_nan.sum(), 1)),
+                        probs_aux[:, P_idx:],
                     ]
 
             for idx, val in enumerate(idxs_nan):
                 if val:
                     test_lab[idx] = test_labels.pop(0)
 
-        # Classify other residues
+        # All other residues: exclude BOTH GLY and PRO.
         else:
             lda = LDA()
-            train_set_aux = train_t.query('amino!="PRO" or amino!="GLY"')[nuclei_meas].copy()
+            train_set_aux = train_t.query(
+                'amino != "PRO" and amino != "GLY"'
+            )[nuclei_meas].copy()
+
             labels = train_labels[
-                np.logical_or(train_labels != "PRO", train_labels != "GLY")
+                (train_labels != "PRO")
+                & (train_labels != "GLY")
             ].copy()
+
             idxs = train_set_aux.isnull().any(axis=1)
-            train_set_aux = train_set_aux[~idxs]
+            train_set_aux = train_set_aux.loc[~idxs]
             labels = labels[~idxs]
 
             lda.fit(train_set_aux, labels)
             probs_aux = lda.predict_proba(test_missing_comb)
             test_labels = list(lda.predict(test_missing_comb))
+
             if all(x in AATs_unique for x in ["GLY", "PRO"]):
-                probs[idxs_nan, :] = np.c_[probs_aux[:, :G_idx], np.zeros((idxs_nan.sum(), 1)),
-                    probs_aux[:, G_idx:P_idx - 1], np.zeros((idxs_nan.sum(), 1)),
-                    probs_aux[:, P_idx - 1:]
+                probs[idxs_nan, :] = np.c_[
+                    probs_aux[:, :G_idx],
+                    np.zeros((idxs_nan.sum(), 1)),
+                    probs_aux[:, G_idx:P_idx - 1],
+                    np.zeros((idxs_nan.sum(), 1)),
+                    probs_aux[:, P_idx - 1:],
                 ]
             elif "PRO" in AATs_unique:
-                probs[idxs_nan, :] = np.c_[probs_aux[:, :P_idx], \
-                    np.zeros((idxs_nan.sum(), 1)), probs_aux[:, P_idx:]]
+                probs[idxs_nan, :] = np.c_[
+                    probs_aux[:, :P_idx],
+                    np.zeros((idxs_nan.sum(), 1)),
+                    probs_aux[:, P_idx:],
+                ]
             elif "GLY" in AATs_unique:
-                probs[idxs_nan, :] = np.c_[probs_aux[:, :G_idx], \
-                    np.zeros((idxs_nan.sum(), 1)), probs_aux[:, G_idx:]]
+                probs[idxs_nan, :] = np.c_[
+                    probs_aux[:, :G_idx],
+                    np.zeros((idxs_nan.sum(), 1)),
+                    probs_aux[:, G_idx:],
+                ]
             else:
                 probs[idxs_nan, :] = probs_aux
+
             for idx, val in enumerate(idxs_nan):
                 if val:
                     test_lab[idx] = test_labels.pop(0)
 
-    df_probs = pd.DataFrame(probs, index=test_t.index, columns=AATs_unique)
-    df_protein = pd.DataFrame({"real labels": check_labels, "classified as": test_lab, "LDA score": df_probs.max(axis=1).values})
+    # ---------------------------------------------------------
+    # 7. Store and export classification results.
+    # ---------------------------------------------------------
+    df_probs = pd.DataFrame(
+        probs,
+        index=test_t.index,
+        columns=AATs_unique,
+    )
+
+    df_protein = pd.DataFrame({
+        "real labels": check_labels,
+        "classified as": test_lab,
+        "LDA score": df_probs.max(axis=1).values,
+    })
+
     content["train"] = train_t
     content["test"] = test_t
+    content["check_labels"] = check_labels
     content["train_labels"] = train_labels
     content["lda_labels"] = df_protein
     content["lda_probs"] = df_probs
 
     if algo == "lda":
-        df_protein.to_csv(Path(output_dir) / f"labels_lda_{note}.csv")
-        df_probs.to_csv(Path(output_dir) / f"probabilities_lda_{note}.csv")
+        df_protein.to_csv(
+            Path(output_dir) / f"labels_lda_{note}.csv"
+        )
+        df_probs.to_csv(
+            Path(output_dir) / f"probabilities_lda_{note}.csv"
+        )
 
     if algo == "lda_bootstrap":
-        df_protein.to_csv(Path(output_dir) / f"labels_lda_bootstrap_{note}.csv")
-        df_probs.to_csv(Path(output_dir) / f"probabilities_lda_bootstrap_{note}.csv")
+        df_protein.to_csv(
+            Path(output_dir) / f"labels_lda_bootstrap_{note}.csv"
+        )
+        df_probs.to_csv(
+            Path(output_dir) / f"probabilities_lda_bootstrap_{note}.csv"
+        )
 
     if algo in ["filtered", "filtered_bootstrap"]:
-        fltr = [i
+        fltr = [
+            i
             for i, a in enumerate(AATs_unique)
             if AATs_count.get(a, 0) / len(check_labels) > 0.01
         ]
+
         protein_filter = probs[:, fltr].max(axis=1) == 1
         filter_p = pd.DataFrame(protein_filter)
         content["filter"] = filter_p
-        cnt_rest = Counter([lab for i, lab in enumerate(test_lab) if protein_filter[i]])
+
+        cnt_rest = Counter(
+            [
+                lab
+                for i, lab in enumerate(test_lab)
+                if protein_filter[i]
+            ]
+        )
         content["count_rest"] = AATs_count - cnt_rest
+
     return content
+
 
 
 ################################### PREPARE FOR SW #############################

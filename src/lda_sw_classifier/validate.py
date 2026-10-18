@@ -76,6 +76,7 @@ def main() -> None:
         new_param_str: str = f"{protein}_{param_str}"
         proteins[protein] = {}
         print(f"\nConducting LDA for {protein}...")
+        print(f"\nParmeters: {parameters}")
         content_lda: Dict[str, Any] = lib.lda_classification_validate(parameters, protein, bmrb_id, str(output_dir))
         proteins[protein]["content_lda"] = content_lda
 
