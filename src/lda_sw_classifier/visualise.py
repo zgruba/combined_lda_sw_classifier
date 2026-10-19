@@ -341,6 +341,8 @@ def main() -> None:
     config = lib.load_config(args.config_path)
     parameters = lib.prepare_parameters(config)
     algo = parameters["algo"]
+    if algo in {"lda", "lda_bootstrap"}:
+        parameters["note"] = lib.lda_note(parameters)
     note = parameters["note"]
     param_str = build_param_str(parameters)
 
