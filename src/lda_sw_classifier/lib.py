@@ -1,3 +1,5 @@
+import hashlib
+import inspect
 import sys
 import warnings
 
@@ -31,6 +33,14 @@ from lda_sw_classifier.temperature import (
     get_temperature_for_shift_list,
     correct_temperature_shifts,
 )
+from lda_sw_classifier.ph import (
+    get_ph_for_shift_list,
+    get_ionic_strength_for_shift_list,
+    get_sequence_for_shift_list,
+    correct_ph_shifts,
+    DEFAULT_IONIC_STRENGTH,
+    DEFAULT_TEMPERATURE,
+)
 
 
 ALL_POSSIBLE = [
@@ -39,6 +49,12 @@ ALL_POSSIBLE = [
 ]
 
 NUM_COLORS = 20
+
+# Downloaded BMRB entries are kept here, so LOO runs fetch every entry once.
+BMRB_CACHE_DIR = Path(__file__).resolve().parents[2] / "Input" / "bmrb_cache"
+
+# Assembled (and corrected) BMRB tables, reused by every LOO fold of a run.
+BMRB_TABLE_CACHE = {}
 
 CM = plt.get_cmap("Spectral")
 
@@ -93,8 +109,14 @@ def prepare_parameters(config):
         "nuclei": config["parameters"]["nuclei"],
         "temperature_correction": config["parameters"]["temperature_correction"],
         "reference_temperature": config["parameters"]["reference_temperature"],
-        "classifier": config["parameters"].get("classifier", "lda")
+        "classifier": config["parameters"].get("classifier", "lda"),
+        "ph_correction": config["parameters"].get("ph_correction", False),
+        "reference_ph": config["parameters"].get("reference_ph", 7.0),
+        "correction_reference": config["parameters"].get("correction_reference", "standard"),
     }
+    # Only added when set, so output filenames of runs without it don't change.
+    if "ph_skip_termini" in config["parameters"]:
+        parameters["ph_skip_termini"] = config["parameters"]["ph_skip_termini"]
     print(parameters)
     return parameters
 
@@ -103,6 +125,44 @@ def lda_note(parameters):
     if parameters["classifier"] == "et_lda":
         return f"{parameters['note']}_et"
     return parameters["note"]
+
+def fetch_bmrb_entry(bmrb_id):
+    """Load a BMRB entry from the local cache, downloading it on first use."""
+    cache_file = BMRB_CACHE_DIR / f"bmr{bmrb_id}.str"
+    if cache_file.exists():
+        return pynmrstar.Entry.from_file(str(cache_file))
+
+    while True:
+        try:
+            ent = pynmrstar.Entry.from_database(bmrb_id)
+            break
+        except (ConnectionError, OSError):
+            print(f"\nConnection error on: {bmrb_id}", flush=True)
+            sleep(2)
+
+    # Write to a temporary file first, so parallel runs never read a partial entry.
+    BMRB_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    tmp_file = cache_file.with_suffix(f".{datetime.now().timestamp()}.tmp")
+    ent.write_to_file(str(tmp_file))
+    tmp_file.replace(cache_file)
+    return ent
+
+def bmrb_table_key(parameters, scanlist):
+    """Hash of everything the assembled BMRB table depends on, including the code."""
+    module_dir = Path(__file__).resolve().parent
+    parts = [
+        "\n".join(scanlist),
+        str(parameters["temperature_correction"]),
+        str(parameters["reference_temperature"]),
+        str(parameters["ph_correction"]),
+        str(parameters["reference_ph"]),
+        str(parameters["correction_reference"]),
+        str(parameters.get("ph_skip_termini", False)),
+        inspect.getsource(assemble_bmrb_table),
+        (module_dir / "temperature.py").read_text(),
+        (module_dir / "ph.py").read_text(),
+    ]
+    return hashlib.sha1("\0".join(parts).encode()).hexdigest()[:16]
 
 def read_bmrb_id(bmrbID_path):
     with open(bmrbID_path, "r") as f:
@@ -1491,36 +1551,46 @@ def get_classifier(parameters, nuclei_meas):
 #     return content
 
 
-def lda_classification_validate(parameters, protein, scanlist, output_dir):
-    content = {}
-    algo = parameters["algo"]
-    note = lda_note(parameters)
+def assemble_bmrb_table(parameters, scanlist):
+    """
+    Residue-level shift table for scanlist and the sequences {protein: {Seq_ID: residue}}.
+    With correction_reference = "standard" the shifts are corrected to the reference
+    temperature/pH here; with "test" they are left uncorrected (see correct_to_test_conditions).
+    """
+    key = bmrb_table_key(parameters, scanlist)
+    if key in BMRB_TABLE_CACHE:
+        TableA, sequences = BMRB_TABLE_CACHE[key]
+        return TableA.copy(), sequences
+
+    cache_file = BMRB_CACHE_DIR / "tables" / f"{key}.pkl"
+    if cache_file.exists():
+        print(f"\nLoading assembled BMRB data from {cache_file}", flush=True)
+        TableA, sequences = pd.read_pickle(cache_file)
+        BMRB_TABLE_CACHE[key] = (TableA, sequences)
+        return TableA.copy(), sequences
+
     reference_temperature = parameters["reference_temperature"]
     temperature_correction = parameters["temperature_correction"]
+    reference_ph = parameters["reference_ph"]
+    ph_correction = parameters["ph_correction"]
+    sequences = {}
 
     names = [
         "H", "HB", "HB1", "HB2", "HB3",
         "CA", "CB", "C", "CO", "N",
         "amino", "protein", "temperature_K",
+        "seq_id", "pH", "ionic_strength",
     ]
     TableB = pd.DataFrame(columns=names)
 
     # Download and assemble BMRB residue-level data.
     for k, l in enumerate(scanlist):
-        waiter = True
-
         sys.stdout.write(
             f"\nScanning data from BMRB: {k + 1} of {len(scanlist)}"
         )
         sys.stdout.flush()
 
-        while waiter:
-            try:
-                ent = pynmrstar.Entry.from_database(l)
-                waiter = False
-            except (ConnectionError, OSError):
-                print(f"\nConnection error on: {l}", flush=True)
-                sleep(2)
+        ent = fetch_bmrb_entry(l)
 
         spectral_peaks = ent.get_saveframes_by_category(
             "assigned_chemical_shifts"
@@ -1534,6 +1604,11 @@ def lda_classification_validate(parameters, protein, scanlist, output_dir):
         temperature_K = get_temperature_for_shift_list(
             ent, shift_frame
         )
+        pH = get_ph_for_shift_list(ent, shift_frame)
+        ionic_strength = get_ionic_strength_for_shift_list(
+            ent, shift_frame
+        )
+        sequences[l] = get_sequence_for_shift_list(ent, shift_frame)
 
         TableC = pd.DataFrame(columns=names)
 
@@ -1563,6 +1638,9 @@ def lda_classification_validate(parameters, protein, scanlist, output_dir):
             TableC.at[n, "protein"] = l
             TableC.at[n, "amino"] = x[i]
             TableC.at[n, "temperature_K"] = temperature_K
+            TableC.at[n, "seq_id"] = seq_id
+            TableC.at[n, "pH"] = pH
+            TableC.at[n, "ionic_strength"] = ionic_strength
 
             atom_name = str(y[i]).strip()
             shift_value = pd.to_numeric(z[i], errors="coerce")
@@ -1588,6 +1666,15 @@ def lda_classification_validate(parameters, protein, scanlist, output_dir):
 
     TableA["temperature_K"] = pd.to_numeric(
         TableB["temperature_K"],
+        errors="coerce",
+    )
+    TableA["seq_id"] = TableB["seq_id"]
+    TableA["pH"] = pd.to_numeric(
+        TableB["pH"],
+        errors="coerce",
+    )
+    TableA["ionic_strength"] = pd.to_numeric(
+        TableB["ionic_strength"],
         errors="coerce",
     )
 
@@ -1629,12 +1716,88 @@ def lda_classification_validate(parameters, protein, scanlist, output_dir):
     else:
         TableA["HA"] = np.nan
 
+    standard_reference = parameters["correction_reference"] == "standard"
+
     # Apply temperature correction before scaling.
-    if temperature_correction:
+    if temperature_correction and standard_reference:
         TableA = correct_temperature_shifts(
             TableA,
             reference_temperature=reference_temperature,
         )
+
+    if ph_correction and standard_reference:
+        TableA = correct_ph_shifts(
+            TableA,
+            sequences,
+            reference_ph=reference_ph,
+            skip_termini=parameters.get("ph_skip_termini", False),
+        )
+
+    # Write to a temporary file first, so parallel runs never read a partial table.
+    cache_file.parent.mkdir(parents=True, exist_ok=True)
+    tmp_file = cache_file.with_suffix(f".{datetime.now().timestamp()}.tmp")
+    pd.to_pickle((TableA, sequences), tmp_file)
+    tmp_file.replace(cache_file)
+    BMRB_TABLE_CACHE[key] = (TableA, sequences)
+    return TableA.copy(), sequences
+
+def correct_to_test_conditions(TableA, sequences, protein, parameters):
+    """
+    Correct every protein to the temperature and pH of the test protein, which itself
+    stays unchanged. If the test protein has no temperature (pH), that correction is skipped.
+    """
+    test_rows = TableA["protein"] == protein
+
+    if parameters["temperature_correction"]:
+        test_temperature = pd.to_numeric(
+            TableA.loc[test_rows, "temperature_K"], errors="coerce"
+        ).iloc[0]
+        if pd.notna(test_temperature):
+            TableA = correct_temperature_shifts(
+                TableA,
+                reference_temperature=float(test_temperature),
+            )
+
+    if parameters["ph_correction"]:
+        test_ph = pd.to_numeric(
+            TableA.loc[test_rows, "pH"], errors="coerce"
+        ).iloc[0]
+        if pd.notna(test_ph):
+            # "test_full" also fits the pKa of the reference state at the temperature and
+            # ionic strength of the test protein; "test" keeps those of each training protein.
+            reference_temperature = reference_ionic_strength = None
+            if parameters["correction_reference"] == "test_full":
+                test_conditions = TableA.loc[test_rows, ["temperature_K", "ionic_strength"]].apply(
+                    pd.to_numeric, errors="coerce"
+                ).iloc[0]
+                reference_temperature = (
+                    DEFAULT_TEMPERATURE if pd.isna(test_conditions["temperature_K"])
+                    else float(test_conditions["temperature_K"])
+                )
+                reference_ionic_strength = (
+                    DEFAULT_IONIC_STRENGTH if pd.isna(test_conditions["ionic_strength"])
+                    else float(test_conditions["ionic_strength"])
+                )
+            TableA = correct_ph_shifts(
+                TableA,
+                sequences,
+                reference_ph=float(test_ph),
+                intrinsic_reference=False,
+                reference_temperature=reference_temperature,
+                reference_ionic_strength=reference_ionic_strength,
+                skip_termini=parameters.get("ph_skip_termini", False),
+            )
+
+    return TableA
+
+def lda_classification_validate(parameters, protein, scanlist, output_dir):
+    content = {}
+    algo = parameters["algo"]
+    note = lda_note(parameters)
+    TableA, sequences = assemble_bmrb_table(parameters, scanlist)
+
+    if parameters["correction_reference"] in ["test", "test_full"]:
+        TableA = correct_to_test_conditions(TableA, sequences, protein, parameters)
 
     AAT_dict = {
         "A": "ALA", "R": "ARG", "N": "ASN", "D": "ASP",
@@ -2088,11 +2251,15 @@ def lda_classification_classify(
     note = lda_note(parameters)
     reference_temperature = parameters["reference_temperature"]
     temperature_correction = parameters["temperature_correction"]
+    reference_ph = parameters["reference_ph"]
+    ph_correction = parameters["ph_correction"]
+    sequences = {}
 
     names = [
         "H", "HB", "HB1", "HB2", "HB3",
         "CA", "CB", "C", "CO", "N",
         "amino", "protein", "temperature_K",
+        "seq_id", "pH", "ionic_strength",
     ]
 
     test_data = pd.read_excel(excel_protein, engine="openpyxl")
@@ -2102,20 +2269,12 @@ def lda_classification_classify(
     # 1. Download BMRB entries and preserve their temperatures.
     # ---------------------------------------------------------
     for k, l in enumerate(scanlist):
-        waiter = True
-
         sys.stdout.write(
             f"\nScanning data from BMRB: {k + 1} of {len(scanlist)}"
         )
         sys.stdout.flush()
 
-        while waiter:
-            try:
-                ent = pynmrstar.Entry.from_database(l)
-                waiter = False
-            except (ConnectionError, OSError):
-                print(f"\nConnection error on: {l}", flush=True)
-                sleep(2)
+        ent = fetch_bmrb_entry(l)
 
         spectral_peaks = ent.get_saveframes_by_category(
             "assigned_chemical_shifts"
@@ -2130,6 +2289,11 @@ def lda_classification_classify(
             ent,
             shift_frame,
         )
+        pH = get_ph_for_shift_list(ent, shift_frame)
+        ionic_strength = get_ionic_strength_for_shift_list(
+            ent, shift_frame
+        )
+        sequences[l] = get_sequence_for_shift_list(ent, shift_frame)
 
         TableC = pd.DataFrame(columns=names)
 
@@ -2159,6 +2323,9 @@ def lda_classification_classify(
             TableC.at[n, "protein"] = l
             TableC.at[n, "amino"] = x[i]
             TableC.at[n, "temperature_K"] = temperature_K
+            TableC.at[n, "seq_id"] = seq_id
+            TableC.at[n, "pH"] = pH
+            TableC.at[n, "ionic_strength"] = ionic_strength
 
             atom_name = str(y[i]).strip()
             shift_value = pd.to_numeric(z[i], errors="coerce")
@@ -2183,6 +2350,15 @@ def lda_classification_classify(
     TableA["protein"] = TableB["protein"]
     TableA["temperature_K"] = pd.to_numeric(
         TableB["temperature_K"],
+        errors="coerce",
+    )
+    TableA["seq_id"] = TableB["seq_id"]
+    TableA["pH"] = pd.to_numeric(
+        TableB["pH"],
+        errors="coerce",
+    )
+    TableA["ionic_strength"] = pd.to_numeric(
+        TableB["ionic_strength"],
         errors="coerce",
     )
 
@@ -2223,6 +2399,14 @@ def lda_classification_classify(
         TableA = correct_temperature_shifts(
             TableA,
             reference_temperature=reference_temperature,
+        )
+
+    if ph_correction:
+        TableA = correct_ph_shifts(
+            TableA,
+            sequences,
+            reference_ph=reference_ph,
+            skip_termini=parameters.get("ph_skip_termini", False),
         )
 
     # The temperature metadata is deliberately not a classifier feature.

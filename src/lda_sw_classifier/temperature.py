@@ -117,6 +117,9 @@ def get_temperature_for_shift_list(ent, shift_frame):
             unit_normalized = unit.strip().lower()
 
             if unit_normalized in {"k", "kelvin", "kelvins"}:
+                # Some entries give degrees Celsius with unit K (e.g. 23.4 K in BMRB 27626).
+                if temperature < 150:
+                    return temperature + 273.15
                 return temperature
 
             if unit_normalized in {
@@ -149,8 +152,6 @@ def correct_temperature_shifts(
     Rows without a known temperature or coefficient remain unchanged.
     """
     corrected = df.copy()
-
-    print("In correct shifts")
 
     if "temperature_K" not in corrected.columns:
         raise ValueError(
@@ -193,32 +194,10 @@ def correct_temperature_shifts(
             & shift.notna()
         )
 
-        print(
-            f"[DEBUG] feature={feature}, "
-            f"rows={len(corrected)}, "
-            f"valid_rows={int(valid.sum())}, "
-            f"temperature_available={int(temperature.notna().sum())}, "
-            f"amino_acid_recognized={int(beta.notna().sum())}, "
-            f"shift_available={int(shift.notna().sum())}",
-            flush=True,
-        )
-
         corrected_values = (
             shift.loc[valid]
             - beta.loc[valid] * delta_t.loc[valid] / 1000.0
         )
-
-        for idx in corrected.index[valid]:
-            print(
-                f"[Temperature correction] "
-                f"row={idx}, "
-                f"amino={amino.loc[idx]}, "
-                f"nucleus={feature}, "
-                f"before={shift.loc[idx]:.4f} ppm, "
-                f"after={corrected_values.loc[idx]:.4f} ppm, "
-                f"temperature_K={temperature.loc[idx]:.2f}, "
-                f"reference_temperature={reference_temperature:.2f} K"
-            )
 
         corrected.loc[valid, feature] = corrected_values
 
