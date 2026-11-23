@@ -92,7 +92,8 @@ def main() -> None:
             parameters["seed"], parameters["eps"]
         )
         content_sw = lib.validate(
-            1, train, test, parameters, PARAMS_AMINO, param_str, str(output_dir)
+            1, train, test, parameters, PARAMS_AMINO, param_str, str(output_dir),
+            content_lda["count_rest"]
         )
         if parameters["algo"] != "sw":
             content_combined = lib.combine_methods(

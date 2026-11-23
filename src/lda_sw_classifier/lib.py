@@ -498,13 +498,16 @@ def get_key(my_dict, val):
     return None
 
 def voting_spec(
-    n_projections, n_specPRO, n_specGLY, s_labels, t_labels, classes, X_s_projections,
+    n_projections, n_specPRO, n_specGLY, s_labels, t_counts, classes, X_s_projections,
     X_t_projections, X_s_dim0, X_t_dim0, parameters_amino, scale, kappa1=2.1,
     kappa2=2.1, k = None, with_bins = False
 ):
-    # Dictionary with occurrences in the test set
-    t_labels = list(t_labels)
-    lab_dict = {lab:t_labels.count(lab) for lab in set(t_labels)}
+    # Expected number of residues of each class still to assign (from the sequence,
+    # content["count_rest"]), not the true labels of the test set
+    # t_labels = list(t_labels)
+    # lab_dict = {lab:t_labels.count(lab) for lab in set(t_labels)}
+    lab_dict = {lab: cnt for lab, cnt in t_counts.items() if cnt > 0}
+    t_labels = list(lab_dict)
     train_lab_dict = {
         lab : [id for id, l in enumerate(s_labels) if l == lab] for lab in set(s_labels)
     }
@@ -929,7 +932,7 @@ def classify_sw(
     )
 
 def classify_sw_spec(
-    X_s, X_t, s_labels, t_labels, classes, n_projections, dimPRO, dimGLY, n_specPRO, n_specGLY,
+    X_s, X_t, s_labels, t_counts, classes, n_projections, dimPRO, dimGLY, n_specPRO, n_specGLY,
     parameters_amino, seed, device, scale, kappa1=2.1, kappa2=2.1, k = None, with_bins = False,
     printing=False
 ):
@@ -946,7 +949,7 @@ def classify_sw_spec(
                 X_t_projections[:,1]: {X_t_projections[:,1]}\n directions[1]: {directions[1]}\n")
 
     return voting_spec(
-        n_projections, n_specPRO, n_specGLY, s_labels, t_labels,
+        n_projections, n_specPRO, n_specGLY, s_labels, t_counts,
         classes, X_s_projections, X_t_projections, X_s.shape[0], X_t.shape[0], parameters_amino,
         scale, kappa1=kappa1, kappa2=kappa2, k = k, with_bins = with_bins
     )
@@ -2876,7 +2879,7 @@ def useful_structures(test: pd.DataFrame):
 
 def classify_in_combination(
     train, train_labels, test, check_labels, nuclei, test_lab, test_nan, prob_matrix,
-    comb, parameters, params_comb
+    comb, parameters, params_comb, count_rest
 ):
     n_projections = parameters["n_projections"]
     seed = parameters["seed"]
@@ -2934,13 +2937,16 @@ def classify_in_combination(
         )
     elif vote_type == "SPECIAL":
         test_labels, total_transport_classes = classify_sw_spec(
-            x1_torch, x2_torch, train_comb_labels, check_comb_labels, classes = ALL_POSSIBLE,
+            x1_torch, x2_torch, train_comb_labels, count_rest, classes = ALL_POSSIBLE,
             dimPRO=dimPRO, dimGLY=dimGLY, n_projections=n_projections, n_specPRO=n_specPRO,
             n_specGLY=n_specGLY, parameters_amino=params_comb, seed=gen, device=device,
             scale=scale, k=k, kappa1=kappa1, kappa2=kappa2, with_bins=with_bins
         )
     else:
         assert False, "Only NORMAL or SPECIAL"
+
+    # Residues assigned here are no longer available to the next combinations
+    count_rest.subtract(Counter(test_labels))
 
     li = 0
     for idx, val in enumerate(idxs_nan):
@@ -2950,16 +2956,18 @@ def classify_in_combination(
             li +=1
     return (test_lab, prob_matrix)
 
-def validate(i, train, test, parameters, parameters_amino, param_str, output_dir):
+def validate(i, train, test, parameters, parameters_amino, param_str, output_dir, count_rest):
     train_labels, check_labels, test_drop, nuclei = prepare_labels(train, test)
     nuclei = parameters["nuclei"]
     useful_structs = useful_structures(test_drop)
     test_lab, test_nan, combs_nan, prob_matrix = useful_structs
+    # Copy, shared by all combinations and decreased as residues get assigned
+    count_rest = Counter(count_rest)
 
     for k, comb in enumerate(combs_nan):
         print(f"{datetime.now().time()} Task {i} in comb {k+1} of {len(combs_nan)}.", flush=True)
         result = classify_in_combination(train, train_labels, test, check_labels, nuclei, test_lab,\
-                             test_nan, prob_matrix, comb, parameters, parameters_amino)
+                             test_nan, prob_matrix, comb, parameters, parameters_amino, count_rest)
         if result is None:
             continue
 
@@ -3002,7 +3010,11 @@ def combine_methods(output_dir, content_lda, content_sw, param_str):
     probs_combined = probs_combined.reindex(columns=desired_columns, fill_value=0.0)
 
     # Count real label occurrences in LDA labels
-    AATs_count = Counter(lda_labels["real labels"].values)
+    # AATs_count = Counter(lda_labels["real labels"].values)
+    # Expected class sizes of the residues left after LDA filtering, from the sequence
+    # (real labels are unknown when classifying, and leak the answer when validating)
+    AATs_count = Counter({lab: cnt for lab, cnt in content_lda["count_rest"].items() if cnt > 0})
+    n_rest = max(sum(AATs_count.values()), 1)
     best_method  = None
     methods = []
     # Adjust SW label classification based on LDA and SW scores (probabilities)
@@ -3010,7 +3022,7 @@ def combine_methods(output_dir, content_lda, content_sw, param_str):
         best_label = sw_labels["classified as"].iloc[i]
         best_method = 'SW'
         if prob_lda.max(axis=1).iloc[i] >= 0.55:
-            if AATs_count[prob_lda.idxmax(axis=1).iloc[i]]/len(lda_labels.index) >= 0.01:
+            if AATs_count[prob_lda.idxmax(axis=1).iloc[i]]/n_rest >= 0.01:
                 best_label = prob_lda.idxmax(axis=1).iloc[i]
                 best_method = 'LDA'
             if prob_sw.max(axis=0).iloc[i] >= 0.8 and prob_sw.idxmax(axis=0).iloc[i] != best_label:

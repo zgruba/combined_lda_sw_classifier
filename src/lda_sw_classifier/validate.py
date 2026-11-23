@@ -87,7 +87,8 @@ def main() -> None:
                 parameters["seed"], parameters["eps"]
             )
             content_sw: Dict[str, Any] = lib.validate(
-                i+1, train, test, parameters, PARAMS_AMINO, new_param_str, str(output_dir)
+                i+1, train, test, parameters, PARAMS_AMINO, new_param_str, str(output_dir),
+                content_lda["count_rest"]
             )
             proteins[protein]["content_sw"] = content_sw
 
