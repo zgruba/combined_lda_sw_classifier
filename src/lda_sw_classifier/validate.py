@@ -81,7 +81,7 @@ def main() -> None:
         proteins[protein]["content_lda"] = content_lda
 
         if parameters["algo"] not in ["lda", "lda_bootstrap"]:
-            print(f"\nConducting SW for {protein}...")
+            print(f"\nConducting {parameters['transport'].upper()} for {protein}...")
             train, test, _ = lib.prepare_data(
                 parameters["algo"], content_lda, parameters["sample_method"],
                 parameters["seed"], parameters["eps"]
@@ -95,7 +95,7 @@ def main() -> None:
             if parameters["algo"] != "sw":
                 print(f"Combining methods for {protein}...")
                 content_combined: Dict[str, Any] = lib.combine_methods(
-                    str(output_dir), content_lda, content_sw, new_param_str
+                    str(output_dir), content_lda, content_sw, new_param_str, parameters
                 )
                 proteins[protein]["content_combined"] = content_combined
 

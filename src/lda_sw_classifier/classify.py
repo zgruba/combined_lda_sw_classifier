@@ -97,7 +97,7 @@ def main() -> None:
         )
         if parameters["algo"] != "sw":
             content_combined = lib.combine_methods(
-                str(output_dir), content_lda, content_sw, param_str
+                str(output_dir), content_lda, content_sw, param_str, parameters
             )
             print(f"CONTENT combined: {content_combined}")
 

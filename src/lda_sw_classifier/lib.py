@@ -22,6 +22,7 @@ import toml
 import torch
 
 from pycirclize import Circos
+from scipy.optimize import linear_sum_assignment
 from scipy.spatial.distance import cdist
 from sklearn.discriminant_analysis import LinearDiscriminantAnalysis as LDA
 from sklearn.ensemble import ExtraTreesClassifier
@@ -30,6 +31,9 @@ from pathlib import Path
 
 warnings.filterwarnings("ignore")
 from masserstein import NMRSpectrum, estimate_proportions # pylint: disable=wrong-import-position
+from wnet import WassersteinNetwork, Distribution # pylint: disable=wrong-import-position
+from wnet.distribution import Distribution_1D # pylint: disable=wrong-import-position
+from wnet.distances import DistanceMetric # pylint: disable=wrong-import-position
 from lda_sw_classifier.temperature import (
     get_temperature_for_shift_list,
     correct_temperature_shifts,
@@ -114,12 +118,21 @@ def prepare_parameters(config):
         "ph_correction": config["parameters"].get("ph_correction", False),
         "reference_ph": config["parameters"].get("reference_ph", 7.0),
         "correction_reference": config["parameters"].get("correction_reference", "standard"),
+        "transport": config["parameters"].get("transport", "sw"),
+        "bins_backend": config["parameters"].get("bins_backend", "magnetstein"),
     }
     # Only added when set, so output filenames of runs without it don't change.
     if "ph_skip_termini" in config["parameters"]:
         parameters["ph_skip_termini"] = config["parameters"]["ph_skip_termini"]
     if "ph_skip_neutral" in config["parameters"]:
         parameters["ph_skip_neutral"] = config["parameters"]["ph_skip_neutral"]
+    # W cost metric (L1 | L2 | LINF), ET filter (all | certain) and combination rule
+    # (tree | mix | assign) with its parameters; also only added when set.
+    for key in [
+        "w_metric", "et_filter", "combine", "combine_weight", "combine_floor", "combine_slack"
+    ]:
+        if key in config["parameters"]:
+            parameters[key] = config["parameters"][key]
     print(parameters)
     return parameters
 
@@ -355,6 +368,65 @@ def bins_transport(projected1, projected2, kappa1=2.1, kappa2=2.1, balance=None)
                 continue
     return transport_plan
 
+def wnet_bins_transport(projected1, projected2, kappa1=2.1, kappa2=2.1):
+    """
+    Function returning transport plan using wnet (the magnetstein model: auxiliary points
+    with costs kappa1 and kappa2, proportion of the second spectrum optimised)
+    """
+    x1 = projected1.detach().numpy().astype(np.float64)
+    x2 = projected2.detach().numpy().astype(np.float64)
+    network = WassersteinNetwork(
+        Distribution_1D(x1, np.full(len(x1), 1 / len(x1))),
+        [Distribution_1D(x2, np.full(len(x2), 1 / len(x2)))],
+        DistanceMetric.L1, force_dense_1d=True, cost_precision_bits=30
+    )
+    network.add_independent_asymmetric_trash(kappa1, kappa2)
+    network.build()
+
+    # The cost is convex in the proportion, so bisect on the sign of its derivative
+    low, high = 0.0, 2.0
+    network.solve([high])
+    while network.spectrum_proportion_derivatives()[0] <= 0:
+        low, high = high, 2 * high
+        network.solve([high])
+    for _ in range(30):
+        mid = (low + high) / 2
+        network.solve([mid])
+        if network.spectrum_proportion_derivatives()[0] > 0:
+            high = mid
+        else:
+            low = mid
+    network.solve([(low + high) / 2])
+
+    idx1, idx2, flows = network.flows_for_target(0)
+    transport_plan = np.zeros((len(x1), len(x2)))
+    np.add.at(transport_plan, (np.asarray(idx1), np.asarray(idx2)), np.asarray(flows))
+    # The optimal 1D plan is not unique; take the monotone one (as magnetstein and ot.emd_1d)
+    transport_plan = monotone_plan(x1, transport_plan.sum(axis=1), x2, transport_plan.sum(axis=0))
+    # Normalised by the transported mass, as in bins_transport
+    if transport_plan.sum() > 0:
+        transport_plan = transport_plan / transport_plan.sum()
+    return transport_plan
+
+def monotone_plan(x1, mass1, x2, mass2):
+    """
+    Function returning the monotone (north-west corner) transport plan between 1D marginals
+    """
+    order1, order2 = np.argsort(x1, kind="stable"), np.argsort(x2, kind="stable")
+    left1, left2 = mass1[order1].astype(np.float64), mass2[order2].astype(np.float64)
+    transport_plan = np.zeros((len(x1), len(x2)))
+    i = j = 0
+    while i < len(order1) and j < len(order2):
+        moved = min(left1[i], left2[j])
+        transport_plan[order1[i], order2[j]] += moved
+        left1[i] -= moved
+        left2[j] -= moved
+        if left1[i] <= 1e-15 * max(1.0, mass1.sum()):
+            i += 1
+        if left2[j] <= 1e-15 * max(1.0, mass2.sum()):
+            j += 1
+    return transport_plan
+
 def do_sw(
     X_s, X_t, n_projections, seed, device
 ) :
@@ -408,7 +480,8 @@ def do_sw_spec(
 
 def voting(
     n_projections, s_labels, classes, X_s_projections, X_t_projections, X_s_dim0,
-    X_t_dim0, scale, kappa1=2.1, kappa2=2.1, k = None, with_bins = False
+    X_t_dim0, scale, kappa1=2.1, kappa2=2.1, k = None, with_bins = False,
+    bins_backend = "magnetstein"
 ):
     """
     Function returning list of labels and total transport plan for classes
@@ -429,7 +502,8 @@ def voting(
     for i in range(n_projections):
         if with_bins and X_s_projections[:,i].nelement() != 0 and \
                 X_t_projections[:,i].nelement() != 0:
-            emd = bins_transport(
+            transport_fn = wnet_bins_transport if bins_backend == "wnet" else bins_transport
+            emd = transport_fn(
                 X_s_projections[:,i], X_t_projections[:,i], kappa1=kappa1, kappa2=kappa2
             )
             total_transport = total_transport + emd
@@ -500,7 +574,7 @@ def get_key(my_dict, val):
 def voting_spec(
     n_projections, n_specPRO, n_specGLY, s_labels, t_counts, classes, X_s_projections,
     X_t_projections, X_s_dim0, X_t_dim0, parameters_amino, scale, kappa1=2.1,
-    kappa2=2.1, k = None, with_bins = False
+    kappa2=2.1, k = None, with_bins = False, bins_backend = "magnetstein"
 ):
     # Expected number of residues of each class still to assign (from the sequence,
     # content["count_rest"]), not the true labels of the test set
@@ -733,7 +807,8 @@ def voting_spec(
 
         if with_bins and X_s_projections[:,i].nelement() != 0 and \
                 X_t_projections[:,i].nelement() != 0:
-            emd = bins_transport(
+            transport_fn = wnet_bins_transport if bins_backend == "wnet" else bins_transport
+            emd = transport_fn(
                 X_s_projections[:,i], X_t_projections[:,i], kappa1=kappa1, kappa2=kappa2
                 )
             total_transport = total_transport + emd
@@ -914,7 +989,7 @@ def voting_spec(
 
 def classify_sw(
     X_s, X_t, s_labels, classes, n_projections, seed, device, scale, kappa1=2.1, kappa2=2.1,
-    k = None, with_bins = False, printing=False
+    k = None, with_bins = False, bins_backend = "magnetstein", printing=False
 ):
     proj_dict = do_sw(X_s, X_t, n_projections, seed, device)
     X_s_projections = proj_dict["X_s_projections"].cpu().detach()
@@ -928,13 +1003,14 @@ def classify_sw(
 
     return voting(
         n_projections, s_labels, classes, X_s_projections, X_t_projections, X_s.shape[0],
-        X_t.shape[0], scale, kappa1=kappa1, kappa2=kappa2, k = k, with_bins = with_bins
+        X_t.shape[0], scale, kappa1=kappa1, kappa2=kappa2, k = k, with_bins = with_bins,
+        bins_backend = bins_backend
     )
 
 def classify_sw_spec(
     X_s, X_t, s_labels, t_counts, classes, n_projections, dimPRO, dimGLY, n_specPRO, n_specGLY,
     parameters_amino, seed, device, scale, kappa1=2.1, kappa2=2.1, k = None, with_bins = False,
-    printing=False
+    bins_backend = "magnetstein", printing=False
 ):
     proj_dict = do_sw_spec(
         X_s, X_t, n_projections, dimPRO, dimGLY, n_specPRO, n_specGLY, seed, device
@@ -951,7 +1027,8 @@ def classify_sw_spec(
     return voting_spec(
         n_projections, n_specPRO, n_specGLY, s_labels, t_counts,
         classes, X_s_projections, X_t_projections, X_s.shape[0], X_t.shape[0], parameters_amino,
-        scale, kappa1=kappa1, kappa2=kappa2, k = k, with_bins = with_bins
+        scale, kappa1=kappa1, kappa2=kappa2, k = k, with_bins = with_bins,
+        bins_backend = bins_backend
     )
 
 
@@ -1006,6 +1083,60 @@ def find_best_reference(AATs_count, train_t, nuclei, eps):
         sampled_group = group_with_counts.head(AATs_count[amino])
         sampled_df = pd.concat([sampled_df, sampled_group])
     return sampled_df
+############################## W CLASSIFIER ####################################
+def classify_w(
+    X_s, X_t, s_labels, classes, kappa1=2.1, kappa2=2.1, with_bins=False, metric="L2",
+    class_mass=None
+):
+    """
+    Function returning list of labels and total transport plan for classes
+    (multidimensional Wasserstein distance computed with wnet, no projections).
+    With class_mass ({class: share}) every class gets that share of the train mass,
+    split evenly among its points; otherwise all train points get the same mass.
+    """
+    total_transport_classes = np.zeros((len(classes), X_t.shape[0]))
+    if X_s.shape[0] == 0:
+        return ["None"] * X_t.shape[0], total_transport_classes
+
+    if class_mass is None:
+        # Uniform intensities normalised to 1, as in SW
+        source_mass = np.full(X_s.shape[0], 1 / X_s.shape[0])
+    else:
+        labels = pd.Series(s_labels)
+        source_mass = (
+            labels.map(class_mass).fillna(0.0) / labels.map(labels.value_counts())
+        ).to_numpy(dtype=np.float64)
+        source_mass = source_mass / source_mass.sum()
+    source = Distribution(X_s.T, source_mass)
+    target = Distribution(X_t.T, np.full(X_t.shape[0], 1 / X_t.shape[0]))
+    # Chemical shift differences are below 1 ppm, so costs must not be rounded to integers
+    network = WassersteinNetwork(
+        source, [target], getattr(DistanceMetric, metric), cost_precision_bits=30
+    )
+    if with_bins:
+        # Auxiliary points as in magnetstein: unmatched train mass costs kappa1, test mass kappa2
+        network.add_independent_asymmetric_trash(kappa1, kappa2)
+    else:
+        # Costlier than any transport, so it only absorbs intensity rounding
+        diameter = np.linalg.norm(
+            np.ptp(np.vstack([X_s, X_t]), axis=0), ord=1 if metric == "L1" else None
+        )
+        network.add_simple_trash(2 * diameter + 1)
+    network.build()
+    network.solve()
+
+    s_idx, t_idx, flows = network.flows_for_target(0)
+    transport_plan = np.zeros((X_s.shape[0], X_t.shape[0]))
+    np.add.at(transport_plan, (np.asarray(s_idx), np.asarray(t_idx)), np.asarray(flows))
+
+    for j, lab in enumerate(s_labels):
+        total_transport_classes[classes.index(lab)] += transport_plan[j]
+
+    # Test points transported entirely to auxiliary points stay unclassified
+    test_labels = [
+        classes[np.argmax(col)] if col.max() > 0 else "None" for col in total_transport_classes.T
+    ]
+    return test_labels, total_transport_classes
 
 ################################### LDA ########################################
 
@@ -1013,6 +1144,15 @@ def use_extra_trees(parameters, nuclei_meas):
     """ET is used when at least two of CA, HB, CB are measured (classifier = et_lda)."""
     n_best = sum(nucleus in nuclei_meas for nucleus in ["CA", "HB", "CB"])
     return parameters["classifier"] == "et_lda" and n_best >= 2
+
+def fixed_et_rows(parameters, used_et, probs):
+    """
+    ET rows kept out of SW/W: all of them (et_filter = "all"), or with
+    et_filter = "certain" only those with top probability 1, as for LDA rows.
+    """
+    if parameters.get("et_filter", "all") == "certain":
+        return used_et & (probs.max(axis=1) == 1)
+    return used_et
 
 def get_classifier(parameters, nuclei_meas):
     """ExtraTrees or LDA, depending on the measured nuclei."""
@@ -2225,7 +2365,7 @@ def lda_classification_validate(parameters, protein, scanlist, output_dir):
 
         protein_filter[protein] = (
             probs[:, fltr].max(axis=1) == 1
-        ) | used_et
+        ) | fixed_et_rows(parameters, used_et, probs)
 
         filter_p = pd.DataFrame(
             protein_filter[protein],
@@ -2803,7 +2943,9 @@ def lda_classification_classify(
             if AATs_count.get(a, 0) / len(check_labels) > 0.01
         ]
 
-        protein_filter = (probs[:, fltr].max(axis=1) == 1) | used_et
+        protein_filter = (
+            probs[:, fltr].max(axis=1) == 1
+        ) | fixed_et_rows(parameters, used_et, probs)
         filter_p = pd.DataFrame(protein_filter)
         content["filter"] = filter_p
 
@@ -2841,6 +2983,9 @@ def prepare_data(algo, content, sample_method, seed, eps):
     nuclei = te.drop(columns=["amino", "protein"]).columns
     if sample_method == "BEST":
         tr = find_best_reference(AATs_count, tr, nuclei, eps)
+    elif sample_method == "ALL":
+        # Every train point of the classes still to assign (W weights them by count_rest)
+        tr = tr[tr["amino"].isin([amino for amino, cnt in AATs_count.items() if cnt > 0])]
     elif sample_method in {"RAND", "CENT"}:
         is_rand = sample_method == "RAND"
         samples = []
@@ -2879,13 +3024,14 @@ def useful_structures(test: pd.DataFrame):
 
 def classify_in_combination(
     train, train_labels, test, check_labels, nuclei, test_lab, test_nan, prob_matrix,
-    comb, parameters, params_comb, count_rest
+    comb, parameters, params_comb, count_rest, class_mass=None
 ):
     n_projections = parameters["n_projections"]
     seed = parameters["seed"]
     k = parameters["k"]
     device = parameters["device"]
     with_bins = parameters["with_bins"]
+    bins_backend = parameters["bins_backend"]
     vote_type = parameters["vote_type"]
     scale = parameters["scale"]
     kappa1 = parameters["kappa1"]
@@ -2929,18 +3075,25 @@ def classify_in_combination(
     AATs_unique = list(set(train_comb_labels))
     AATs_unique.sort()
 
-    if vote_type == "NORMAL":
+    if parameters["transport"] == "w":
+        test_labels, total_transport_classes = classify_w(
+            train_comb, test_comb, train_comb_labels, classes=ALL_POSSIBLE, kappa1=kappa1,
+            kappa2=kappa2, with_bins=with_bins, metric=parameters.get("w_metric", "L2"),
+            class_mass=class_mass
+        )
+    elif vote_type == "NORMAL":
         test_labels, total_transport_classes = classify_sw(
             x1_torch, x2_torch, train_comb_labels, classes=ALL_POSSIBLE,
             n_projections=n_projections, seed=gen, device=device, scale=scale, k=k, kappa1=kappa1,
-            kappa2=kappa2, with_bins=with_bins
+            kappa2=kappa2, with_bins=with_bins, bins_backend=bins_backend
         )
     elif vote_type == "SPECIAL":
         test_labels, total_transport_classes = classify_sw_spec(
             x1_torch, x2_torch, train_comb_labels, count_rest, classes = ALL_POSSIBLE,
             dimPRO=dimPRO, dimGLY=dimGLY, n_projections=n_projections, n_specPRO=n_specPRO,
             n_specGLY=n_specGLY, parameters_amino=params_comb, seed=gen, device=device,
-            scale=scale, k=k, kappa1=kappa1, kappa2=kappa2, with_bins=with_bins
+            scale=scale, k=k, kappa1=kappa1, kappa2=kappa2, with_bins=with_bins,
+            bins_backend=bins_backend
         )
     else:
         assert False, "Only NORMAL or SPECIAL"
@@ -2963,11 +3116,18 @@ def validate(i, train, test, parameters, parameters_amino, param_str, output_dir
     test_lab, test_nan, combs_nan, prob_matrix = useful_structs
     # Copy, shared by all combinations and decreased as residues get assigned
     count_rest = Counter(count_rest)
+    # W with every train point (sample_method = "ALL"): class masses from the expected
+    # composition of all residues left, the same for every combination
+    class_mass = None
+    if parameters["transport"] == "w" and parameters["sample_method"] == "ALL":
+        rest = {lab: cnt for lab, cnt in count_rest.items() if cnt > 0}
+        class_mass = {lab: cnt / sum(rest.values()) for lab, cnt in rest.items()}
 
     for k, comb in enumerate(combs_nan):
         print(f"{datetime.now().time()} Task {i} in comb {k+1} of {len(combs_nan)}.", flush=True)
         result = classify_in_combination(train, train_labels, test, check_labels, nuclei, test_lab,\
-                             test_nan, prob_matrix, comb, parameters, parameters_amino, count_rest)
+                             test_nan, prob_matrix, comb, parameters, parameters_amino, count_rest,
+                             class_mass)
         if result is None:
             continue
 
@@ -2992,7 +3152,56 @@ def validate(i, train, test, parameters, parameters_amino, param_str, output_dir
     }
 
 ######################################## COMBINE #######################################
-def combine_methods(output_dir, content_lda, content_sw, param_str):
+def assign_to_composition(scores, classes, count_rest, slack=1.0):
+    """
+    Labels maximising the summed scores (residues x classes), when every class has as many
+    slots as expected from count_rest (scaled to the number of residues) times slack.
+    """
+    n_res = scores.shape[0]
+    if n_res == 0:
+        return []
+    counts = np.array([max(count_rest.get(c, 0), 0) for c in classes], dtype=np.float64)
+    slots = np.round(counts / max(counts.sum(), 1) * n_res).astype(int)
+    slots = np.ceil(slots * slack + (slack > 1)).astype(int)
+    cols = np.repeat(np.arange(len(classes)), slots)
+    if len(cols) < n_res:
+        # Never fewer slots than residues
+        cols = np.concatenate([cols, np.repeat(np.arange(len(classes)), n_res)])
+    rows, picked = linear_sum_assignment(-scores[:, cols])
+    labels = [None] * n_res
+    for r, c in zip(rows, picked):
+        labels[r] = classes[cols[c]]
+    return labels
+
+def combine_by_scores(prob_lda, prob_sw, count_rest, parameters):
+    """
+    Labels and probabilities of the residues left after filtering, from the classifier
+    (LDA/ET, residues x classes) and transport (SW/W, classes x residues) probabilities.
+    combine = "mix": argmax of w * classifier + (1 - w) * transport.
+    combine = "assign": residues assigned to the slots given by count_rest, maximising the
+    sum of w * log(classifier + 1e-4) + (1 - w) * log(transport + floor).
+    """
+    assert parameters["combine"] in {"mix", "assign"}, "combine: tree, mix or assign"
+    classes = list(prob_sw.index)
+    p_lda = prob_lda.reindex(columns=classes, fill_value=0.0).to_numpy(dtype=np.float64)
+    p_tr = prob_sw.T.to_numpy(dtype=np.float64)
+    weight = parameters["combine_weight"]
+
+    if parameters["combine"] == "mix":
+        probs = weight * p_lda + (1 - weight) * p_tr
+        return [classes[j] for j in probs.argmax(axis=1)], probs
+
+    scores = weight * np.log(p_lda + 1e-4) + \
+        (1 - weight) * np.log(p_tr + parameters.get("combine_floor", 0.1))
+    # Pooled probabilities, normalised LDA^w * transport^(1-w)
+    probs = np.exp(scores - scores.max(axis=1, keepdims=True))
+    probs = probs / probs.sum(axis=1, keepdims=True)
+    labels = assign_to_composition(
+        scores, classes, count_rest, parameters.get("combine_slack", 1.0)
+    )
+    return labels, probs
+
+def combine_methods(output_dir, content_lda, content_sw, param_str, parameters=None):
     # Extract relevant data
     prob_sw = content_sw["sw_probs"]
     sw_labels = content_sw["sw_labels"]
@@ -3017,8 +3226,18 @@ def combine_methods(output_dir, content_lda, content_sw, param_str):
     n_rest = max(sum(AATs_count.values()), 1)
     best_method  = None
     methods = []
+    # combine = "tree" (default): the rule below; "mix" / "assign": combine_by_scores
+    rule = parameters.get("combine", "tree") if parameters else "tree"
+    rest_labels, rest_probs = None, None
+    if rule != "tree":
+        rest_labels, rest_probs = combine_by_scores(prob_lda, prob_sw, AATs_count, parameters)
     # Adjust SW label classification based on LDA and SW scores (probabilities)
     for i in range(len(sw_labels.index)):
+        if rest_probs is not None:
+            sw_labels.at[i, "classified as"] = str(rest_labels[i])
+            sw_labels.at[i, "LDA score"] = prob_lda.idxmax(axis=1).iloc[i]
+            methods.append(rule.upper())
+            continue
         best_label = sw_labels["classified as"].iloc[i]
         best_method = 'SW'
         if prob_lda.max(axis=1).iloc[i] >= 0.55:
@@ -3045,7 +3264,10 @@ def combine_methods(output_dir, content_lda, content_sw, param_str):
         if lab == 'LDA':
             continue
         else:
-            prob_values = prob_sw.iloc[:, i].to_numpy()
+            if rest_probs is None:
+                prob_values = prob_sw.iloc[:, i].to_numpy()
+            else:
+                prob_values = rest_probs[i]
             probs_combined.iloc[j, :] = prob_values
 
     probs_combined = probs_combined.where(probs_combined > 0.01, 0.0)
