@@ -2397,8 +2397,9 @@ def lda_classification_validate(parameters, protein, scanlist, output_dir):
 def lda_classification_classify(
     parameters, excel_protein, scanlist, fasta_path, output_dir
 ):
+    # Header lines (">...") are skipped, so standard FASTA files work.
     with open(fasta_path, "r") as f:
-        fasta = "".join(line.strip() for line in f)
+        fasta = "".join(line.strip() for line in f if not line.startswith(">"))
 
     content = {}
     algo = parameters["algo"]
@@ -2629,6 +2630,9 @@ def lda_classification_classify(
         train_data = train_data.drop(
             train_data.query("amino == @AAT").index
         )
+
+    # Also drop non-standard residues (e.g. PTR), which are not classes.
+    train_data = train_data[train_data["amino"].isin(AATs_unique)]
 
     # ---------------------------------------------------------
     # 4. Scale training and test features together.
