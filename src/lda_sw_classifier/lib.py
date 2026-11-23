@@ -121,6 +121,12 @@ def prepare_parameters(config):
         "transport": config["parameters"].get("transport", "sw"),
         "bins_backend": config["parameters"].get("bins_backend", "magnetstein"),
     }
+    # Any other value would silently skip the correction.
+    if parameters["correction_reference"] not in ["standard", "test"]:
+        raise ValueError(
+            f"correction_reference must be 'standard' or 'test', "
+            f"not '{parameters['correction_reference']}'"
+        )
     # Only added when set, so output filenames of runs without it don't change.
     if "ph_skip_termini" in config["parameters"]:
         parameters["ph_skip_termini"] = config["parameters"]["ph_skip_termini"]
@@ -1912,21 +1918,19 @@ def correct_to_test_conditions(TableA, sequences, protein, parameters):
             TableA.loc[test_rows, "pH"], errors="coerce"
         ).iloc[0]
         if pd.notna(test_ph):
-            # "test_full" also fits the pKa of the reference state at the temperature and
-            # ionic strength of the test protein; "test" keeps those of each training protein.
-            reference_temperature = reference_ionic_strength = None
-            if parameters["correction_reference"] == "test_full":
-                test_conditions = TableA.loc[test_rows, ["temperature_K", "ionic_strength"]].apply(
-                    pd.to_numeric, errors="coerce"
-                ).iloc[0]
-                reference_temperature = (
-                    DEFAULT_TEMPERATURE if pd.isna(test_conditions["temperature_K"])
-                    else float(test_conditions["temperature_K"])
-                )
-                reference_ionic_strength = (
-                    DEFAULT_IONIC_STRENGTH if pd.isna(test_conditions["ionic_strength"])
-                    else float(test_conditions["ionic_strength"])
-                )
+            # The pKa of the reference state is fitted at the temperature and ionic strength
+            # of the test protein.
+            test_conditions = TableA.loc[test_rows, ["temperature_K", "ionic_strength"]].apply(
+                pd.to_numeric, errors="coerce"
+            ).iloc[0]
+            reference_temperature = (
+                DEFAULT_TEMPERATURE if pd.isna(test_conditions["temperature_K"])
+                else float(test_conditions["temperature_K"])
+            )
+            reference_ionic_strength = (
+                DEFAULT_IONIC_STRENGTH if pd.isna(test_conditions["ionic_strength"])
+                else float(test_conditions["ionic_strength"])
+            )
             TableA = correct_ph_shifts(
                 TableA,
                 sequences,
@@ -1946,7 +1950,7 @@ def lda_classification_validate(parameters, protein, scanlist, output_dir):
     note = lda_note(parameters)
     TableA, sequences = assemble_bmrb_table(parameters, scanlist)
 
-    if parameters["correction_reference"] in ["test", "test_full"]:
+    if parameters["correction_reference"] == "test":
         TableA = correct_to_test_conditions(TableA, sequences, protein, parameters)
 
     AAT_dict = {
