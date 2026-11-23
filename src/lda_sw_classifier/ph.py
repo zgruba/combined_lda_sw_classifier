@@ -314,7 +314,7 @@ def load_pkas(keys):
         for key, pkas in pd.read_pickle(PKA_CACHE_FILE).items():
             PKA_CACHE.setdefault(key, pkas)
     PKA_CACHE_FILE.parent.mkdir(parents=True, exist_ok=True)
-    tmp_file = PKA_CACHE_FILE.with_suffix(f".{datetime.now().timestamp()}.tmp")
+    tmp_file = PKA_CACHE_FILE.with_suffix(f".{os.getpid()}.{datetime.now().timestamp()}.tmp")
     pd.to_pickle(dict(PKA_CACHE), tmp_file)
     tmp_file.replace(PKA_CACHE_FILE)
 
@@ -484,7 +484,7 @@ def get_sequence_for_shift_list(ent, shift_frame):
 
 def correct_ph_shifts(df, sequences, reference_ph=7.0, intrinsic_reference=True,
                       reference_temperature=None, reference_ionic_strength=None,
-                      skip_termini=False):
+                      skip_termini=False, skip_neutral=False):
     """
     Normalize chemical shifts to a reference pH (see get_ph_offsets for
     intrinsic_reference, reference_temperature and reference_ionic_strength).
@@ -494,7 +494,9 @@ def correct_ph_shifts(df, sequences, reference_ph=7.0, intrinsic_reference=True,
     {Seq_ID: one-letter residue}. Proteins without a known pH or
     sequence, and residues whose type does not match the sequence,
     remain unchanged. With skip_termini the first and last residue of
-    the sequence also remain unchanged, as in POTENCI.
+    the sequence also remain unchanged, as in POTENCI. With skip_neutral
+    proteins whose pH is within 0.01 of reference_ph remain unchanged
+    (POTENCI corrects only if pH < 6.99 or pH > 7.01).
     """
     corrected = df.copy()
 
@@ -515,6 +517,9 @@ def correct_ph_shifts(df, sequences, reference_ph=7.0, intrinsic_reference=True,
         sequence = sequences.get(protein)
 
         if pd.isna(ph) or not sequence:
+            continue
+
+        if skip_neutral and abs(float(ph) - float(reference_ph)) <= 0.01 + 1e-9:
             continue
 
         temperature = pd.to_numeric(group["temperature_K"], errors="coerce").iloc[0]

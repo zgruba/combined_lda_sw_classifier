@@ -1,5 +1,6 @@
 import hashlib
 import inspect
+import os
 import sys
 import warnings
 
@@ -117,6 +118,8 @@ def prepare_parameters(config):
     # Only added when set, so output filenames of runs without it don't change.
     if "ph_skip_termini" in config["parameters"]:
         parameters["ph_skip_termini"] = config["parameters"]["ph_skip_termini"]
+    if "ph_skip_neutral" in config["parameters"]:
+        parameters["ph_skip_neutral"] = config["parameters"]["ph_skip_neutral"]
     print(parameters)
     return parameters
 
@@ -142,7 +145,8 @@ def fetch_bmrb_entry(bmrb_id):
 
     # Write to a temporary file first, so parallel runs never read a partial entry.
     BMRB_CACHE_DIR.mkdir(parents=True, exist_ok=True)
-    tmp_file = cache_file.with_suffix(f".{datetime.now().timestamp()}.tmp")
+    # The PID keeps the name unique when parallel runs fetch the same entry at once.
+    tmp_file = cache_file.with_suffix(f".{os.getpid()}.{datetime.now().timestamp()}.tmp")
     ent.write_to_file(str(tmp_file))
     tmp_file.replace(cache_file)
     return ent
@@ -158,6 +162,7 @@ def bmrb_table_key(parameters, scanlist):
         str(parameters["reference_ph"]),
         str(parameters["correction_reference"]),
         str(parameters.get("ph_skip_termini", False)),
+        str(parameters.get("ph_skip_neutral", False)),
         inspect.getsource(assemble_bmrb_table),
         (module_dir / "temperature.py").read_text(),
         (module_dir / "ph.py").read_text(),
@@ -1576,7 +1581,7 @@ def assemble_bmrb_table(parameters, scanlist):
     sequences = {}
 
     names = [
-        "H", "HB", "HB1", "HB2", "HB3",
+        "H", "HA", "HA2", "HA3", "HB", "HB1", "HB2", "HB3",
         "CA", "CB", "C", "CO", "N",
         "amino", "protein", "temperature_K",
         "seq_id", "pH", "ionic_strength",
@@ -1731,11 +1736,12 @@ def assemble_bmrb_table(parameters, scanlist):
             sequences,
             reference_ph=reference_ph,
             skip_termini=parameters.get("ph_skip_termini", False),
+            skip_neutral=parameters.get("ph_skip_neutral", False),
         )
 
     # Write to a temporary file first, so parallel runs never read a partial table.
     cache_file.parent.mkdir(parents=True, exist_ok=True)
-    tmp_file = cache_file.with_suffix(f".{datetime.now().timestamp()}.tmp")
+    tmp_file = cache_file.with_suffix(f".{os.getpid()}.{datetime.now().timestamp()}.tmp")
     pd.to_pickle((TableA, sequences), tmp_file)
     tmp_file.replace(cache_file)
     BMRB_TABLE_CACHE[key] = (TableA, sequences)
@@ -1786,6 +1792,7 @@ def correct_to_test_conditions(TableA, sequences, protein, parameters):
                 reference_temperature=reference_temperature,
                 reference_ionic_strength=reference_ionic_strength,
                 skip_termini=parameters.get("ph_skip_termini", False),
+                skip_neutral=parameters.get("ph_skip_neutral", False),
             )
 
     return TableA
@@ -2256,7 +2263,7 @@ def lda_classification_classify(
     sequences = {}
 
     names = [
-        "H", "HB", "HB1", "HB2", "HB3",
+        "H", "HA", "HA2", "HA3", "HB", "HB1", "HB2", "HB3",
         "CA", "CB", "C", "CO", "N",
         "amino", "protein", "temperature_K",
         "seq_id", "pH", "ionic_strength",
@@ -2407,6 +2414,7 @@ def lda_classification_classify(
             sequences,
             reference_ph=reference_ph,
             skip_termini=parameters.get("ph_skip_termini", False),
+            skip_neutral=parameters.get("ph_skip_neutral", False),
         )
 
     # The temperature metadata is deliberately not a classifier feature.
