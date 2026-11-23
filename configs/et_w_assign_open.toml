@@ -1,0 +1,36 @@
+# ET+LDA+W new, assign, open: ExtraTrees for residues with at least 2 of CA/HB/CB measured, LDA for the rest.
+# Open mode (et_filter = "certain"): only residues with probability exactly 1 are fixed. The others get
+# score = w * log(P_ET+LDA + 1e-4) + (1 - w) * log(P_W + floor) and are assigned to composition slots
+# (linear_sum_assignment), so the labels match the remaining sequence composition.
+# 263 proteins (5D): 94.28 % without correction, 94.43 % T+pH standard, 94.48 % T+pH test.
+[parameters]
+algo = "filtered"       # Options: lda, lda_bootstrap, sw, filtered, filtered_bootstrap
+classifier = "et_lda"   # Options: lda, et_lda
+n_projections = 4000    # not used by W, kept for the output filenames
+seed = 42
+k = 0
+device = "cpu"
+with_bins = true        # W trash (auxiliary points) with costs kappa1, kappa2
+sample_method = "ALL"   # every train point, class mass = remaining composition (W). Options: BEST, RAND, CENT
+vote_type = "SPECIAL"   # Options: NORMAL
+scale = true
+eps = 0.75
+kappa1 = 3.0
+kappa2 = 3.0
+nuclei = ["HN", "N", "CO", "CA", "CB"]
+note = "et_w_assign_open"
+# Temperature and pH correction. "test" is the best in lda_sw_validate; lda_sw_classify always
+# corrects the training data to reference_temperature / reference_ph (as "standard"), and the shifts of
+# the classified protein are used as given. Set both corrections to false for no correction.
+temperature_correction = true
+reference_temperature = 298.0
+ph_correction = true
+reference_ph = 7.0
+correction_reference = "test"   # Options: standard (all proteins to reference_temperature / reference_ph), test (training proteins to the T, pH and ionic strength of the test protein)
+transport = "w"         # Options: sw, w (multidimensional Wasserstein, wnet)
+w_metric = "L1"         # Options: L1, L2, LINF
+et_filter = "certain"   # ET rows fixed only with probability 1 (open). Options: all (every ET row fixed)
+combine = "assign"      # Options: tree (thesis decision tree), mix, assign
+combine_weight = 0.9    # score w * log ET+LDA + (1 - w) * log(W + floor)
+combine_floor = 0.1
+combine_slack = 1.0     # slots per class = composition * slack

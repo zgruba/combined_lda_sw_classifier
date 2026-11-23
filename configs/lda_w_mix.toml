@@ -1,0 +1,30 @@
+# LDA+W new, mix: final probability = w * P_LDA + (1 - w) * P_W, label = argmax.
+# 263 proteins (5D): 88.96 % without correction, 88.91 % T+pH standard, 88.96 % T+pH test.
+[parameters]
+algo = "filtered"       # Options: lda, lda_bootstrap, sw, filtered, filtered_bootstrap
+classifier = "lda"      # Options: lda, et_lda
+n_projections = 4000    # not used by W, kept for the output filenames
+seed = 42
+k = 0
+device = "cpu"
+with_bins = true        # W trash (auxiliary points) with costs kappa1, kappa2
+sample_method = "ALL"   # every train point, class mass = remaining composition (W). Options: BEST, RAND, CENT
+vote_type = "SPECIAL"   # Options: NORMAL
+scale = true
+eps = 0.75
+kappa1 = 3.0
+kappa2 = 3.0
+nuclei = ["HN", "N", "CO", "CA", "CB"]
+note = "lda_w_mix"
+# Temperature and pH correction. "test" is the best in lda_sw_validate; lda_sw_classify always
+# corrects the training data to reference_temperature / reference_ph (as "standard"), and the shifts of
+# the classified protein are used as given. Set both corrections to false for no correction.
+temperature_correction = true
+reference_temperature = 298.0
+ph_correction = true
+reference_ph = 7.0
+correction_reference = "test"   # Options: standard (all proteins to reference_temperature / reference_ph), test (training proteins to the T, pH and ionic strength of the test protein)
+transport = "w"         # Options: sw, w (multidimensional Wasserstein, wnet)
+w_metric = "L1"         # Options: L1, L2, LINF
+combine = "mix"         # Options: tree (thesis decision tree), mix, assign
+combine_weight = 0.55   # w * LDA + (1 - w) * W

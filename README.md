@@ -118,6 +118,39 @@ If you only want to run LDA, set algo = "lda". In this case, all SW-related para
 
 The parameter sample_method set to "BEST" indicates that a density-based selection approach is employed, whereas "RAND" corresponds to random sampling, and "CENT" denotes the utilisation of class centroids. The vote_type parameter set to "SPECIAL" signifies the incorporation of a projections cutoff, while "NORMAL" indicates the absence of such a cutoff. The parameter k defaults to 0, but you may set it to any positive integer. When set, SW classification will use the top-k source points (those with the highest transported mass) for each target point in the voting procedure.
 
+### Combined methods with W (multidimensional Wasserstein)
+
+The `configs/` folder holds ready-to-use configs for four combined methods. Each one replaces SW with the full Wasserstein transport (wnet) and the decision tree with a combination rule:
+
+| Config | Method | Accuracy, 263 proteins (5D): no correction / T+pH standard / T+pH test |
+|---|---|---|
+| `configs/lda_w_mix.toml` | LDA+W, mix | 88.96 / 88.91 / 88.96 % |
+| `configs/lda_w_assign.toml` | LDA+W, assign | 92.14 / 92.25 / 92.35 % |
+| `configs/et_w_mix_open.toml` | ET+LDA+W, mix, open | 91.94 / 91.93 / 92.16 % |
+| `configs/et_w_assign_open.toml` | ET+LDA+W, assign, open | 94.28 / 94.43 / 94.48 % |
+
+```bash
+lda_sw_validate -c configs/et_w_assign_open.toml -i [bmrbID_file] -d [output_directory]
+lda_sw_classify -c configs/et_w_assign_open.toml -i [bmrbID_file] -p [excel_protein] -f [fasta_file] -d [output_directory]
+```
+
+The keys that select these methods (all optional; without them the thesis pipeline runs unchanged):
+
+- `transport = "w"` with `sample_method = "ALL"`: W instead of SW. The source is every training point of the amino acids left in the composition, each class weighted by its share of the composition. `w_metric` (`L1`, `L2`, `LINF`) is the cost, and `kappa1`/`kappa2` are the costs of the auxiliary (trash) points.
+- `classifier = "et_lda"`: ExtraTrees for residues with at least 2 of CA/HB/CB measured, LDA for the rest.
+- `et_filter = "certain"` (open mode): only residues with probability exactly 1 are fixed. With `"all"` (the default), every ExtraTrees residue is fixed.
+- `combine`:
+  - `"tree"` (default): the thesis decision tree.
+  - `"mix"`: the probability is `combine_weight` · P_classifier + (1 − `combine_weight`) · P_W.
+  - `"assign"`: residues are assigned to composition slots (`scipy.optimize.linear_sum_assignment`). The score is `combine_weight` · log P_classifier + (1 − `combine_weight`) · log(P_W + `combine_floor`), with `combine_slack` × composition slots per amino acid.
+
+Temperature and pH correction (`temperature_correction`, `ph_correction`) use `correction_reference`:
+
+- `"standard"`: all proteins are corrected to `reference_temperature`/`reference_ph`.
+- `"test"`: in `lda_sw_validate`, the training proteins are corrected to the temperature and pH of the test protein, which stays as measured. The pKa of the pH reference state is taken at the test protein's temperature and ionic strength.
+
+`lda_sw_classify` corrects only the training data, always to `reference_temperature`/`reference_ph`; the chemical shifts of the classified protein are used as given. The assign rule takes the composition from the FASTA file and scales the slots to the number of residues being classified, so the closer the FASTA matches the residues in the spectrum, the better.
+
 # Citing
 
 If you use tools from this package, please cite:
