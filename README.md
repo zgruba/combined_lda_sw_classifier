@@ -122,12 +122,18 @@ The parameter sample_method set to "BEST" indicates that a density-based selecti
 
 The `configs/` folder holds ready-to-use configs for four combined methods. Each one replaces SW with the full Wasserstein transport (wnet) and the decision tree with a combination rule:
 
-| Config | Method | Accuracy, 263 proteins (5D): no correction / T+pH standard / T+pH test |
-|---|---|---|
-| `configs/lda_w_mix.toml` | LDA+W, mix | 88.96 / 88.91 / 88.96 % |
-| `configs/lda_w_assign.toml` | LDA+W, assign | 92.14 / 92.25 / 92.35 % |
-| `configs/et_w_mix_open.toml` | ET+LDA+W, mix, open | 91.94 / 91.93 / 92.16 % |
-| `configs/et_w_assign_open.toml` | ET+LDA+W, assign, open | 94.28 / 94.43 / 94.48 % |
+Mean leave-one-out accuracy (%) on 263 proteins (5D: HN, N, CO, CA, CB). The columns are the correction settings (see `correction_reference` below; "pH" means `ph_correction = true`, `temperature_correction = false`). The baselines are the classifier alone (`classifier = "lda"` or `"et_lda"`, no W), taken from the same runs:
+
+| Config | Method | No correction | T+pH standard | T+pH test | pH standard | pH test |
+|---|---|---|---|---|---|---|
+| | LDA (baseline) | 86.37 | 86.26 | 86.45 | 86.43 | 86.61 |
+| | ET+LDA (baseline) | 91.26 | 91.33 | 91.60 | 91.44 | 91.61 |
+| `configs/lda_w_mix.toml` | LDA+W, mix | 88.96 | 88.91 | 88.96 | 89.04 | 89.18 |
+| `configs/lda_w_assign.toml` | LDA+W, assign | 92.14 | 92.25 | 92.35 | 92.30 | 92.29 |
+| `configs/et_w_mix_open.toml` | ET+LDA+W, mix, open | 91.94 | 91.93 | 92.16 | 92.05 | 92.17 |
+| `configs/et_w_assign_open.toml` | ET+LDA+W, assign, open | 94.28 | 94.43 | 94.48 | 94.26 | 94.45 |
+
+For every method and correction setting, the gain over its baseline is significant (paired Wilcoxon over proteins, p < 0.001). The differences between correction settings are not significant (all p > 0.05).
 
 ```bash
 lda_sw_validate -c configs/et_w_assign_open.toml -i [bmrbID_file] -d [output_directory]
